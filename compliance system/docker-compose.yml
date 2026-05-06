@@ -1,0 +1,35 @@
+# ============================================================================
+# Docker Compose — Compliance Automation Platform
+# ============================================================================
+# Usage:
+#   docker compose up --build        (foreground)
+#   docker compose up --build -d     (background)
+#   docker compose down              (stop)
+# ============================================================================
+
+services:
+  compliance-orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: compliance-orchestrator
+    env_file:
+      - .env
+    environment:
+      - LOG_LEVEL=INFO
+      - REPORT_OUTPUT_DIR=/app/reports
+    volumes:
+      - reports:/app/reports
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+        reservations:
+          memory: 512M
+          cpus: "0.5"
+
+volumes:
+  reports:
+    driver: local
