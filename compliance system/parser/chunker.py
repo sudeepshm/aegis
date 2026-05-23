@@ -263,11 +263,26 @@ class SemanticChunker:
         )
 
     def _split_sections(self, text: str) -> list[tuple[str, str]]:
-        """Split text into (heading, body) tuples based on heading patterns."""
+        """
+        Split text into (heading, body) tuples based on heading patterns.
+
+        FIX: If no headings are detected (common in poorly formatted regulatory
+        PDFs), fall back to paragraph-level splitting rather than returning the
+        entire document as a single 'preamble' block.  This prevents downstream
+        chunk loss when the giant preamble is sub-chunked and individual pieces
+        fall below MIN_CHUNK_SIZE.
+        """
         sections: list[tuple[str, str]] = []
         matches = list(self.HEADING_PATTERN.finditer(text))
 
         if not matches:
+            # No headings found — split on paragraph breaks (double newline)
+            paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+            if len(paragraphs) > 1:
+                for i, para in enumerate(paragraphs):
+                    sections.append((f"paragraph_{i + 1}", para))
+                return sections
+            # Single solid block of text — return as-is for sliding-window chunker
             return [("", text)]
 
         # Text before the first heading
@@ -285,6 +300,7 @@ class SemanticChunker:
                 sections.append((heading, body))
 
         return sections
+
 
     def _sliding_window_chunk(self, text: str) -> list[str]:
         """Split text into overlapping chunks using a sliding window."""

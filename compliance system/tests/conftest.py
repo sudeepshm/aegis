@@ -1,7 +1,3 @@
-"""
-Shared test fixtures and configuration for the compliance system test suite.
-"""
-
 import pytest
 import sys
 from pathlib import Path
@@ -11,6 +7,41 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from typing import Dict, Any, List
+import networkx as nx
+
+@pytest.fixture
+def mock_pipeline_state() -> Dict[str, Any]:
+    """Mock PipelineState object as dictionary for tests."""
+    return {
+        "document_id": "test-doc-001",
+        "current_task": "extract",
+        "extracted_obligations": [],
+        "risk_score": 0.0,
+        "anomalies": [],
+        "evidence": [],
+        "status": "in_progress",
+        "metadata": {}
+    }
+
+@pytest.fixture
+def mock_dag() -> List[Dict[str, Any]]:
+    """Mock DAG representing a list of tasks with dependencies."""
+    return [
+        {"task": "A", "depends_on": [], "duration_days": 5},
+        {"task": "B", "depends_on": ["A"], "duration_days": 10},
+        {"task": "C", "depends_on": ["B"], "duration_days": 15}
+    ]
+
+@pytest.fixture
+def mock_ontology() -> nx.DiGraph:
+    """Mock NetworkX ComplianceOntology with 3 nodes."""
+    G = nx.DiGraph()
+    G.add_node("RBI", type="regulator", jurisdiction="IN")
+    G.add_node("DPDP", type="regulation", jurisdiction="IN")
+    G.add_node("GDPR", type="regulation", jurisdiction="EU")
+    G.add_edge("RBI", "DPDP", relationship="enforces")
+    return G
 
 @pytest.fixture
 def sample_regulatory_text() -> str:
@@ -43,11 +74,9 @@ def sample_regulatory_text() -> str:
         "under Section 47A of the Banking Regulation Act, 1949.\n"
     )
 
-
 @pytest.fixture
 def sample_doc_id() -> str:
     return "doc-test-001"
-
 
 @pytest.fixture
 def sample_obligation_text() -> str:

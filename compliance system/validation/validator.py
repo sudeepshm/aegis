@@ -58,6 +58,24 @@ from enum import Enum
 from typing import Any
 import httpx
 
+# ── Phase 6: Intelligent validation layer ─────────────────────────────────────
+try:
+    from validation.intelligent_checks import (
+        AnomalyDetector,
+        ScreenshotOCRVerifier,
+        ForgeryDetector,
+        ComplianceConfidenceScorer,
+        AnomalyReport,
+        OCRVerificationResult,
+        ForgeryReport,
+        ConfidenceBreakdown,
+    )
+    _INTELLIGENT_CHECKS_AVAILABLE = True
+except ImportError as _ic_err:
+    _INTELLIGENT_CHECKS_AVAILABLE = False
+    logger = logging.getLogger("validator")
+    logging.getLogger("validator").warning("intelligent_checks unavailable: %s", _ic_err)
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
 # ─────────────────────────────────────────────────────────────────────────────
@@ -81,9 +99,11 @@ BACKDATE_TOLERANCE_MINUTES = 5      # clock skew tolerance for submission time
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ValidationOutcome(str, Enum):
-    PASS   = "PASS"
-    FAIL   = "FAIL"
-    REWORK = "REWORK"   # FAIL + rework loop triggered
+    PASS            = "PASS"
+    FAIL            = "FAIL"
+    REWORK          = "REWORK"          # FAIL + rework loop triggered
+    FRAUD_SUSPECTED = "FRAUD_SUSPECTED"  # ForgeryDetector flagged HIGH risk
+    ANOMALY_DETECTED = "ANOMALY_DETECTED" # AnomalyDetector flagged HIGH risk
 
 
 class CheckCategory(str, Enum):
@@ -155,6 +175,11 @@ class ValidationReport:
     rework:          ReworkRecord | None
     evidence_hash:   str              # SHA-256 of all serialised evidence
     validated_at:    str
+    # Phase 6 intelligent check results
+    anomaly_report:       Optional[dict[str, Any]] = None
+    forgery_report:       Optional[dict[str, Any]] = None
+    ocr_result:           Optional[dict[str, Any]] = None
+    confidence_breakdown: Optional[dict[str, Any]] = None
 
     def to_dict(self) -> dict:
         return {
@@ -170,6 +195,10 @@ class ValidationReport:
             "rework":               self.rework.to_dict() if self.rework else None,
             "evidence_hash":        self.evidence_hash,
             "validated_at":         self.validated_at,
+            "anomaly_report":       self.anomaly_report,
+            "forgery_report":       self.forgery_report,
+            "ocr_result":           self.ocr_result,
+            "confidence_breakdown": self.confidence_breakdown,
         }
 
 
@@ -729,6 +758,13 @@ class ValidationRequest:
     run_esb_checks:       bool             = True
     run_kv_checks:        bool             = True
     run_doc_checks:       bool             = True
+    # Phase 6 intelligent check inputs
+    screenshot_bytes:     bytes            = b""     # PNG/JPEG config screenshot
+    document_bytes_pdf:   bytes            = b""     # PDF for forgery detection
+    claimed_compliance_date: Any          = None     # date object
+    obligation_text:      str             = ""       # for OCR comparison
+    regulation_ref:       str             = ""       # for temporal forgery check
+    run_intelligent_checks: bool          = True
 
 
 class HybridValidator:
@@ -754,6 +790,14 @@ class HybridValidator:
         self._hash_guard = HashGuard()
         self._sp         = SharePointInspector(sharepoint_url)
         self._rework     = ReworkOrchestrator(teams_webhook_url)
+        # Phase 6 intelligent checkers
+        if _INTELLIGENT_CHECKS_AVAILABLE:
+            self._anomaly  = AnomalyDetector()
+            self._ocr      = ScreenshotOCRVerifier()
+            self._forgery  = ForgeryDetector()
+            self._conf_scorer = ComplianceConfidenceScorer()
+        else:
+            self._anomaly = self._ocr = self._forgery = self._conf_scorer = None
 
     async def validate(self, req: ValidationRequest) -> ValidationReport:
         """
@@ -807,12 +851,89 @@ class HybridValidator:
             for r in sp_results:
                 evidence_blob[r.name] = r.evidence
 
+        # ── Phase 6a: Anomaly Detection ───────────────────────────────────────
+        anomaly_report_dict = None
+        if req.run_intelligent_checks and self._anomaly:
+            doc_size = len(req.document_content or req.document_bytes_pdf or b"")
+            anomaly  = self._anomaly.detect(
+                doc_size_bytes       = doc_size,
+                submission_ts        = datetime.now(tz=timezone.utc),
+                prior_failed_checks  = sum(1 for c in all_checks if not c.passed),
+            )
+            anomaly_report_dict = anomaly.to_dict()
+            if anomaly.risk_level == "HIGH":
+                all_checks.append(CheckResult(
+                    check_id=_new_id(), category=CheckCategory.HASH_GUARD,
+                    name="Anomaly:high_risk", passed=False, confidence=0.15,
+                    explanation=f"AnomalyDetector HIGH: {'; '.join(anomaly.suspicious_features[:2])}",
+                    evidence=anomaly_report_dict,
+                ))
+
+        # ── Phase 6b: Screenshot OCR Verification ────────────────────────────
+        ocr_result_dict = None
+        if req.run_intelligent_checks and self._ocr and req.screenshot_bytes:
+            ocr = self._ocr.verify(
+                image_bytes     = req.screenshot_bytes,
+                obligation_text = req.obligation_text,
+            )
+            ocr_result_dict = ocr.to_dict()
+            if not ocr.passed:
+                all_checks.append(CheckResult(
+                    check_id=_new_id(), category=CheckCategory.ESB,
+                    name="OCR:config_mismatch", passed=False, confidence=ocr.confidence,
+                    explanation=f"OCR mismatch: {'; '.join(ocr.mismatches[:2])}",
+                    evidence=ocr_result_dict,
+                ))
+
+        # ── Phase 6c: Forgery Detection ───────────────────────────────────────
+        forgery_report_dict = None
+        if req.run_intelligent_checks and self._forgery and req.document_bytes_pdf:
+            forgery = self._forgery.detect(
+                document_bytes           = req.document_bytes_pdf,
+                claimed_compliance_date  = req.claimed_compliance_date,
+                regulation_ref           = req.regulation_ref,
+            )
+            forgery_report_dict = forgery.to_dict()
+            if forgery.risk_level == "HIGH":
+                all_checks.append(CheckResult(
+                    check_id=_new_id(), category=CheckCategory.HASH_GUARD,
+                    name="Forgery:high_risk", passed=False, confidence=0.10,
+                    explanation=f"ForgeryDetector HIGH: {'; '.join(forgery.findings[:2])}",
+                    evidence=forgery_report_dict,
+                ))
+
         # ── Aggregate confidence & outcome ────────────────────────────────────
         overall_confidence = self._aggregate_confidence(all_checks)
         failed_checks      = [c for c in all_checks if not c.passed]
         all_passed         = len(failed_checks) == 0 and overall_confidence >= PASS_CONFIDENCE_THRESHOLD
 
-        if all_passed:
+        # Phase 6d: Confidence Breakdown
+        conf_breakdown_dict = None
+        if self._conf_scorer:
+            esb_res = [c for c in all_checks if c.category == CheckCategory.ESB]
+            kv_res  = [c for c in all_checks if c.category == CheckCategory.KEY_VAULT]
+            hg_res  = next((c for c in all_checks if "Hash" in c.name or "hash" in c.name), None)
+            sp_res  = [c for c in all_checks if c.category == CheckCategory.SHAREPOINT]
+            bd = self._conf_scorer.score(
+                esb_results=esb_res, kv_results=kv_res,
+                hash_result=hg_res, sp_results=sp_res,
+            )
+            conf_breakdown_dict = bd.to_dict()
+            overall_confidence  = bd.overall
+
+        # Determine final outcome
+        fraud_flag = forgery_report_dict and forgery_report_dict.get("risk_level") == "HIGH"
+        anomaly_flag = anomaly_report_dict and anomaly_report_dict.get("risk_level") == "HIGH"
+
+        if fraud_flag:
+            outcome = ValidationOutcome.FRAUD_SUSPECTED
+            summary = f"FRAUD SUSPECTED: ForgeryDetector flagged HIGH risk. {'; '.join(forgery_report_dict.get('findings', [])[:2])}"
+            rework  = None
+        elif anomaly_flag and not all_passed:
+            outcome = ValidationOutcome.ANOMALY_DETECTED
+            summary = f"ANOMALY: {'; '.join(anomaly_report_dict.get('suspicious_features', [])[:2])}"
+            rework  = None
+        elif all_passed:
             outcome = ValidationOutcome.PASS
             summary = (
                 f"All {len(all_checks)} checks PASSED. "
@@ -854,6 +975,10 @@ class HybridValidator:
             rework=rework,
             evidence_hash=report_hash,
             validated_at=_now(),
+            anomaly_report       = anomaly_report_dict,
+            forgery_report       = forgery_report_dict,
+            ocr_result           = ocr_result_dict,
+            confidence_breakdown = conf_breakdown_dict,
         )
 
         logger.info(

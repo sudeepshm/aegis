@@ -260,6 +260,59 @@ def retry(
     return decorator
 
 
+def retry_async(
+    *,
+    max_attempts: int = 3,
+    base_delay: float = 1.0,
+    max_delay: float = 60.0,
+    backoff_factor: float = 2.0,
+    jitter: float = 0.1,
+    retriable_exceptions: tuple[type[BaseException], ...] = _ALWAYS_TRANSIENT,
+    on_retry: Callable[[int, Exception, float], None] | None = None,
+) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    """Async-aware exponential backoff retry decorator for coroutines.
+
+    Works like `retry` but expects the decorated function to be an
+    `async def` coroutine and uses `asyncio.sleep` between retries.
+    """
+    all_retriable = tuple(set(retriable_exceptions) | set(_ALWAYS_TRANSIENT))
+
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        if not asyncio.iscoroutinefunction(func):
+            raise TypeError("retry_async can only decorate async functions")
+
+        @functools.wraps(func)
+        async def wrapper(*args: Any, **kwargs: Any) -> Any:
+            last_exc: Exception | None = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return await func(*args, **kwargs)
+                except all_retriable as exc:  # type: ignore[misc]
+                    last_exc = exc
+                    if attempt == max_attempts:
+                        logger.error(
+                            "[retry_async] '%s' exhausted %d/%d attempts. Last error: %s",
+                            func.__qualname__, attempt, max_attempts, exc,
+                        )
+                        raise
+                    raw_delay = min(base_delay * (backoff_factor ** (attempt - 1)), max_delay)
+                    noise     = raw_delay * jitter * (2 * _uniform_01() - 1)
+                    sleep_for = max(0.0, raw_delay + noise)
+                    if on_retry is not None:
+                        on_retry(attempt, exc, sleep_for)
+                    else:
+                        logger.warning(
+                            "[retry_async] '%s' attempt %d/%d failed (%s). Retrying in %.2fs…",
+                            func.__qualname__, attempt, max_attempts, exc, sleep_for,
+                        )
+                    await asyncio.sleep(sleep_for)
+            raise RuntimeError(f"Retry loop exhausted for '{func.__qualname__}'") from last_exc
+
+        return wrapper
+
+    return decorator
+
+
 def _uniform_01() -> float:
     return int.from_bytes(os.urandom(4), "big") / 0xFFFF_FFFF
 

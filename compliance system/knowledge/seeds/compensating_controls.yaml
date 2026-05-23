@@ -1,0 +1,127 @@
+# =============================================================================
+# knowledge/seeds/compensating_controls.yaml
+# =============================================================================
+# Compensating control templates for regulatory tension pairs.
+#
+# Structure:
+#   tensions:
+#     - id:              unique tension identifier
+#       verb_a:          action verb from regulation A
+#       verb_b:          action verb from regulation B (semantic opposite)
+#       object_keywords: list of object keywords where this tension applies
+#       domain_a:        regulatory domain of obligation A
+#       domain_b:        regulatory domain of obligation B
+#       tension_label:   human-readable description of the tension
+#       compensating_controls:
+#         - description of a control that satisfies BOTH obligations simultaneously
+#
+# =============================================================================
+
+tensions:
+  - id: retention_vs_erasure
+    verb_a: retain
+    verb_b: delete
+    object_keywords: [customer, data, log, record, information, personal]
+    domain_a: aml
+    domain_b: data_protection
+    tension_label: "RBI/AML 5-year retention vs DPDP data minimization & erasure"
+    compensating_controls:
+      - "Retain minimum data fields required by AML (transaction amount, counterparty, date)
+         for 5 years. Delete all other personal data fields (name, address, biometrics)
+         after the primary purpose is served. Document the AML lawful basis under DPDP
+         Section 4 (legitimate use) in your privacy notice."
+      - "Implement field-level tokenization: retain PII in encrypted cold storage with
+         access logs; expose only pseudonymized transaction identifiers to AML systems.
+         This satisfies retention requirements while minimizing actual PII exposure."
+      - "Use a Data Retention Schedule approved by both Legal (DPDP compliance) and
+         Compliance (AML requirements). Schedule must be reviewed annually and signed
+         by the Data Protection Officer."
+
+  - id: retention_vs_minimize
+    verb_a: retain
+    verb_b: minimize
+    object_keywords: [data, record, log, information]
+    domain_a: aml
+    domain_b: data_protection
+    tension_label: "Log retention vs data minimization principle"
+    compensating_controls:
+      - "Apply the principle of proportionality: retain only the minimum data fields
+         required to satisfy the regulatory retention obligation. Implement automated
+         data classification to tag retention-mandated fields."
+      - "Use structured retention policies: retain regulatory-mandated data in a
+         dedicated compliance archive; apply minimization to all other data."
+
+  - id: share_vs_encrypt
+    verb_a: share
+    verb_b: encrypt
+    object_keywords: [data, information, customer, record, report]
+    domain_a: kyc
+    domain_b: encryption
+    tension_label: "Data sharing requirement vs end-to-end encryption mandate"
+    compensating_controls:
+      - "Share data using AES-256 encrypted channels (TLS 1.3 in transit + AES-256
+         at rest). Use field-level encryption for PII fields; decrypt only at the
+         authorized recipient endpoint using Azure Key Vault CMK."
+      - "Implement a Secure Data Exchange: share data via Azure Private Link with
+         mutual TLS authentication. The receiving entity must possess a signed
+         certificate from the same PKI hierarchy."
+      - "Use the 'encrypt then share' pattern: encrypt data with recipient's public key
+         before transmission. Only the intended recipient can decrypt — satisfies both
+         sharing and encryption obligations simultaneously."
+
+  - id: log_vs_suppress
+    verb_a: log
+    verb_b: disable
+    object_keywords: [log, audit, event, access, transaction]
+    domain_a: cyber
+    domain_b: data_protection
+    tension_label: "Audit logging requirement vs right-to-erasure for logged personal data"
+    compensating_controls:
+      - "Log security events without PII: use pseudonymized user identifiers (hashed
+         employee ID) in security logs. Map pseudonym to real identity only via a
+         secure lookup table accessible to authorized investigators only."
+      - "Implement log segregation: security/audit logs (retained for compliance) vs
+         operational logs (subject to DPDP erasure). Only operational logs containing
+         PII are subject to the erasure right."
+
+  - id: restrict_vs_allow
+    verb_a: restrict
+    verb_b: permit
+    object_keywords: [access, connection, port, service, endpoint]
+    domain_a: cyber
+    domain_b: outsourcing
+    tension_label: "Network restriction vs third-party access permission"
+    compensating_controls:
+      - "Implement Zero Trust Network Access (ZTNA): permit only specific authenticated
+         third-party identities to access specific resources on a per-session basis.
+         All other access is denied by default."
+      - "Use a dedicated API gateway with OAuth2 scoped tokens for third-party access.
+         This permits necessary access while maintaining network restrictions for all
+         other traffic."
+
+  - id: maximize_vs_minimize_capital
+    verb_a: maximize
+    verb_b: minimize
+    object_keywords: [capital, buffer, ratio, reserve]
+    domain_a: capital
+    domain_b: liquidity
+    tension_label: "Capital buffer maximization vs liquidity optimization"
+    compensating_controls:
+      - "Use High Quality Liquid Assets (HQLA) — primarily government securities —
+         which simultaneously count toward both LCR liquidity requirements and
+         capital adequacy as Tier 1 assets."
+      - "Implement an integrated Asset-Liability Management (ALM) framework that
+         optimizes the capital/liquidity trade-off. Present the joint optimization
+         to the Board Risk Committee quarterly."
+
+  - id: encrypt_vs_transmit
+    verb_a: encrypt
+    verb_b: transmit
+    object_keywords: [data, information, message, payload]
+    domain_a: encryption
+    domain_b: kyc
+    tension_label: "Encryption mandate vs KYC data transmission to CKYC registry"
+    compensating_controls:
+      - "Transmit to CKYC registry using TLS 1.3 (in-transit encryption) + CKYC's
+         public key encryption of the payload. The registry decrypts at their end.
+         Both the 'encrypt' and 'transmit' obligations are satisfied simultaneously."

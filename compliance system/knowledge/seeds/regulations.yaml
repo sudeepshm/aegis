@@ -1,0 +1,477 @@
+# =============================================================================
+# regulations.yaml
+# =============================================================================
+# Seed data for the ComplianceOntology — Indian regulatory framework.
+#
+# Scope (Phase 1): RBI, SEBI, CERT-In, DPDP Act 2023, Basel III (India-bound)
+#
+# Node fields
+# -----------
+#   id            : unique regulation identifier (internal)
+#   reg_id        : official regulatory reference string
+#   source        : RBI | SEBI | CERT_IN | DPDP | BASEL | IRDAI
+#   title         : human-readable short title
+#   effective_date: YYYY-MM-DD
+#   expiry_date   : YYYY-MM-DD or null (null = still active)
+#   mandatory     : true | false
+#   subject       : who the obligation applies to (e.g. "Scheduled Banks")
+#   domain        : encryption | kyc | aml | cyber | capital | liquidity | data_protection | outsourcing | fraud | audit
+#   summary       : one-line description
+#   clauses       : list of specific clause references
+#   penalty_severity: HIGH | MEDIUM | LOW  (HIGH = licence revocation / large fine)
+#
+# Edge fields
+# -----------
+#   source_id     : id of the source node
+#   target_id     : id of the target node
+#   edge_type     : SUPERSEDES | CONFLICTS_WITH | IMPLEMENTS | DEPENDS_ON | RELATED_TO | EQUIVALENT_TO
+#   effective_date: when the edge relationship became effective
+#   notes         : explanation of the relationship
+# =============================================================================
+
+nodes:
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # RBI — Information Technology & Cyber Security
+  # ─────────────────────────────────────────────────────────────────────────
+
+  - id: rbi_it_framework_2023
+    reg_id: "RBI/2023-24/101"
+    source: RBI
+    title: "Master Direction on Information Technology Governance, Risk, Controls and Assurance Practices"
+    effective_date: "2024-04-01"
+    expiry_date: null
+    mandatory: true
+    subject: "Scheduled Commercial Banks, Small Finance Banks, Payment Banks"
+    domain: cyber
+    summary: "Comprehensive IT governance framework covering encryption, patch management, VAPT, SOC, and third-party risk."
+    clauses:
+      - "Annex I — Encryption Standards: AES-256 for data at rest, TLS 1.3 for data in transit"
+      - "Annex II — Patch Management: Critical patches within 30 days, High within 60 days"
+      - "Annex III — VAPT: Mandatory VAPT every 6 months for internet-facing applications"
+      - "Section 7.4 — SOC: 24x7 Security Operations Centre with SIEM"
+      - "Section 12 — Third-Party Risk: Annual vendor security assessment"
+    penalty_severity: HIGH
+
+  - id: rbi_it_framework_2019
+    reg_id: "RBI/2019-20/58"
+    source: RBI
+    title: "Master Direction on Information Technology Framework for the NBFC Sector"
+    effective_date: "2019-06-08"
+    expiry_date: "2024-03-31"
+    mandatory: true
+    subject: "Non-Banking Financial Companies with assets >= INR 500 Cr"
+    domain: cyber
+    summary: "IT framework for NBFCs covering IS policy, network security, data backup, and BCP."
+    clauses:
+      - "Para 4.1 — Encryption: AES-128 minimum for data at rest"
+      - "Para 5 — Patch Management: Monthly patching cycle"
+      - "Para 7 — Vendor Risk: Annual risk assessment for critical vendors"
+    penalty_severity: MEDIUM
+
+  - id: rbi_cyber_resilience_2024
+    reg_id: "RBI/2023-24/133"
+    source: RBI
+    title: "Master Direction on Cyber Resilience and Digital Payment Security Controls"
+    effective_date: "2024-07-31"
+    expiry_date: null
+    mandatory: true
+    subject: "Payment System Operators, Banks offering digital payments"
+    domain: cyber
+    summary: "Resilience controls for digital payments: tokenisation, fraud monitoring, incident response, VAPT for payment systems."
+    clauses:
+      - "Section 4 — Tokenisation: Mandatory for card-on-file merchants by 2025"
+      - "Section 6 — Real-Time Fraud Monitoring: Transaction anomaly detection within 100ms"
+      - "Section 8 — Incident Response: Report major cyber incidents to RBI within 6 hours"
+      - "Section 9 — VAPT: Mandatory for payment systems every 6 months"
+    penalty_severity: HIGH
+
+  - id: rbi_kyc_master_2016
+    reg_id: "RBI/2015-16/42 (updated 2022)"
+    source: RBI
+    title: "Master Direction — Know Your Customer (KYC) Directions, 2016"
+    effective_date: "2016-02-25"
+    expiry_date: null
+    mandatory: true
+    subject: "All Regulated Entities (Banks, NBFCs, Payment Service Providers)"
+    domain: kyc
+    summary: "KYC obligations: CDD, EDD, video KYC, periodic update of KYC records, beneficial ownership."
+    clauses:
+      - "Rule 6 — CDD: Customer Due Diligence at onboarding"
+      - "Rule 8 — EDD: Enhanced Due Diligence for high-risk customers"
+      - "Rule 9 — Video KYC: Permitted channel for remote account opening"
+      - "Rule 12 — KYC Update: Periodic update every 2/8/10 years based on risk category"
+      - "Rule 15 — Beneficial Ownership: Identify and verify beneficial owner >10% control"
+    penalty_severity: HIGH
+
+  - id: rbi_aml_cft_2023
+    reg_id: "RBI/2023-24/22"
+    source: RBI
+    title: "Master Direction — Anti-Money Laundering (AML) and Combating the Financing of Terrorism (CFT)"
+    effective_date: "2023-04-01"
+    expiry_date: null
+    mandatory: true
+    subject: "All Regulated Entities"
+    domain: aml
+    summary: "AML/CFT controls: STR reporting, transaction monitoring, PEP screening, record retention 5 years."
+    clauses:
+      - "Section 5 — STR: File Suspicious Transaction Report within 7 days of detection"
+      - "Section 7 — Record Retention: Maintain KYC and transaction records for 5 years"
+      - "Section 9 — PEP Screening: Screen against domestic and international PEP lists"
+      - "Section 11 — CTR: Currency Transaction Report for cash transactions > INR 10 lakh"
+    penalty_severity: HIGH
+
+  - id: rbi_outsourcing_2023
+    reg_id: "RBI/2023-24/67"
+    source: RBI
+    title: "Master Direction on Outsourcing of IT Services"
+    effective_date: "2023-10-01"
+    expiry_date: null
+    mandatory: true
+    subject: "Scheduled Commercial Banks, Urban Cooperative Banks"
+    domain: outsourcing
+    summary: "Governance of IT outsourcing: risk assessment, data localisation, exit strategy, cloud controls."
+    clauses:
+      - "Section 6 — Data Localisation: Customer data must reside in India"
+      - "Section 8 — Vendor Assessment: Annual security assessment for critical vendors"
+      - "Section 10 — Exit Strategy: Documented exit plan with 6-month transition period"
+      - "Section 12 — Cloud: Prior RBI approval for critical data on public cloud"
+    penalty_severity: HIGH
+
+  - id: rbi_data_retention_2021
+    reg_id: "RBI/2021-22/89"
+    source: RBI
+    title: "RBI Guidelines on Digital Lending and Data Privacy"
+    effective_date: "2022-09-02"
+    expiry_date: null
+    mandatory: true
+    subject: "Digital Lending Apps, NBFCs, Banks with digital lending"
+    domain: data_protection
+    summary: "Data minimisation, storage limitation, and borrower consent for digital lending."
+    clauses:
+      - "Para 7 — Data Minimisation: Collect only necessary data with borrower consent"
+      - "Para 9 — Retention: Transaction data retained for 5 years; behavioural data not retained beyond loan tenure"
+      - "Para 11 — Third-Party Data: Prohibition on sharing borrower data without explicit consent"
+    penalty_severity: MEDIUM
+
+  - id: rbi_capital_adequacy_2023
+    reg_id: "RBI/2023-24/45"
+    source: RBI
+    title: "Master Circular — Basel III Capital Regulations"
+    effective_date: "2023-04-01"
+    expiry_date: null
+    mandatory: true
+    subject: "Scheduled Commercial Banks (excluding LABs and Payments Banks)"
+    domain: capital
+    summary: "Capital adequacy requirements: CET1, Tier 1, Total CRAR, Capital Conservation Buffer."
+    clauses:
+      - "Para 4.1 — CET1: Minimum 5.5% of Risk Weighted Assets"
+      - "Para 4.2 — Tier 1: Minimum 7.0% of RWA"
+      - "Para 4.3 — CRAR: Minimum 9.0% Total Capital Adequacy Ratio"
+      - "Para 4.4 — CCB: Capital Conservation Buffer 2.5% above minimum"
+      - "Para 5 — Countercyclical Buffer: 0%–2.5% activated by RBI as needed"
+    penalty_severity: HIGH
+
+  - id: rbi_lcr_2024
+    reg_id: "RBI/2024-25/12"
+    source: RBI
+    title: "Draft Guidelines on Liquidity Coverage Ratio — Amendment 2024"
+    effective_date: "2025-04-01"
+    expiry_date: null
+    mandatory: true
+    subject: "Scheduled Commercial Banks"
+    domain: liquidity
+    summary: "LCR amendment: increased run-off rates for internet-sourced retail deposits."
+    clauses:
+      - "Para 3 — Run-off Rate: Retail deposits sourced via internet raised from 10% to 15%"
+      - "Para 5 — HQLA: High Quality Liquid Assets must cover 30-day net outflows"
+      - "Para 7 — Reporting: Daily LCR reporting to RBI"
+    penalty_severity: MEDIUM
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # SEBI — Securities Markets
+  # ─────────────────────────────────────────────────────────────────────────
+
+  - id: sebi_cyber_2023
+    reg_id: "SEBI/HO/ITD/ITD-PoD-1/P/CIR/2023/135"
+    source: SEBI
+    title: "Circular on Cybersecurity and Cyber Resilience Framework for Market Infrastructure Institutions"
+    effective_date: "2023-08-20"
+    expiry_date: null
+    mandatory: true
+    subject: "Stock Exchanges, Clearing Corporations, Depositories"
+    domain: cyber
+    summary: "Cybersecurity framework for MIIs: governance, VAPT, incident response, vendor risk, data classification."
+    clauses:
+      - "Section 3 — Encryption: AES-256 for sensitive data at rest and TLS 1.3 in transit"
+      - "Section 5 — VAPT: Mandatory bi-annual VAPT by CERT-In empanelled auditor"
+      - "Section 6 — Incident Reporting: Report cyber incidents to SEBI within 6 hours"
+      - "Section 8 — Third-Party Risk: Vendor security assessment annually"
+      - "Section 10 — SOC: 24x7 SOC with SIEM integration mandatory"
+    penalty_severity: HIGH
+
+  - id: sebi_cloud_2023
+    reg_id: "SEBI/HO/ITD/ITD_VAPT/P/CIR/2023/186"
+    source: SEBI
+    title: "Circular on Cloud Adoption for SEBI Regulated Entities"
+    effective_date: "2024-01-01"
+    expiry_date: null
+    mandatory: true
+    subject: "Market Intermediaries, Asset Management Companies"
+    domain: cyber
+    summary: "Cloud adoption framework: data residency, encryption, multi-tenancy isolation, CSP due diligence."
+    clauses:
+      - "Para 4 — Data Residency: Critical data must be stored in India"
+      - "Para 5 — Encryption: End-to-end encryption with customer-managed keys"
+      - "Para 7 — Exit: Cloud exit strategy with data portability requirement"
+      - "Para 9 — Audit: Annual audit of cloud service provider"
+    penalty_severity: MEDIUM
+
+  - id: sebi_aml_2023
+    reg_id: "SEBI/HO/MIRSD/MIRSD-PoD-1/P/CIR/2023/007"
+    source: SEBI
+    title: "SEBI Master Circular on Anti-Money Laundering"
+    effective_date: "2023-01-01"
+    expiry_date: null
+    mandatory: true
+    subject: "SEBI Registered Intermediaries"
+    domain: aml
+    summary: "AML controls for securities markets: KYC, STR, record keeping, correspondent relationships."
+    clauses:
+      - "Section 4 — KYC: PAN-linked KYC mandatory for all investors"
+      - "Section 6 — STR: File STR with FIU-IND within 7 days of suspicion"
+      - "Section 8 — Record Keeping: Maintain transaction records for 5 years"
+    penalty_severity: HIGH
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # CERT-In — Cyber Incident Reporting
+  # ─────────────────────────────────────────────────────────────────────────
+
+  - id: certin_directions_2022
+    reg_id: "CERT-In Directions 2022 (S.O. 2106(E))"
+    source: CERT_IN
+    title: "CERT-In Directions on Cyber Security under Section 70B of IT Act 2000"
+    effective_date: "2022-04-28"
+    expiry_date: null
+    mandatory: true
+    subject: "All Service Providers, Intermediaries, Data Centres, Body Corporates, Government Entities"
+    domain: cyber
+    summary: "Mandatory incident reporting within 6 hours, ICT logs for 180 days, time sync with NTP servers, VPN logs 5 years."
+    clauses:
+      - "Direction 3 — Incident Reporting: Mandatory report to CERT-In within 6 hours of detection"
+      - "Direction 4 — Log Retention: Maintain ICT system logs for 180 days"
+      - "Direction 5 — NTP Sync: Synchronise all ICT systems with NTP server of NIC/NPCI/IRNSS"
+      - "Direction 6 — VPN Logs: Service providers maintaining VPN must retain logs for 5 years"
+      - "Direction 8 — Subscriber/Customer Info: Maintain data for 5 years after relationship ends"
+    penalty_severity: HIGH
+
+  - id: certin_ransomware_advisory_2022
+    reg_id: "CERT-In Advisory CIVN-2022-0290"
+    source: CERT_IN
+    title: "CERT-In Advisory on Ransomware Attacks and Mitigations"
+    effective_date: "2022-10-12"
+    expiry_date: null
+    mandatory: false
+    subject: "All organisations using IT systems"
+    domain: cyber
+    summary: "Best practices for ransomware prevention: offline backups, patch management, network segmentation."
+    clauses:
+      - "Control 1 — Backup: Maintain offline backups tested quarterly"
+      - "Control 2 — Patching: Apply patches within 7 days for ransomware-exploited CVEs"
+      - "Control 3 — Segmentation: Network segmentation to limit lateral movement"
+    penalty_severity: LOW
+
+  - id: certin_old_reporting_2014
+    reg_id: "CERT-In Circular 2014-IT-Reporting"
+    source: CERT_IN
+    title: "CERT-In Incident Reporting Guidelines 2014 (Superseded)"
+    effective_date: "2014-01-01"
+    expiry_date: "2022-04-27"
+    mandatory: false
+    subject: "Government entities, Critical infrastructure"
+    domain: cyber
+    summary: "Legacy incident reporting — 72-hour reporting window (superseded by 6-hour mandate in 2022)."
+    clauses:
+      - "Section 4 — Reporting: Cyber incidents to be reported within 72 hours"
+    penalty_severity: LOW
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # DPDP Act 2023
+  # ─────────────────────────────────────────────────────────────────────────
+
+  - id: dpdp_act_2023
+    reg_id: "DPDP Act 2023 (No. 22 of 2023)"
+    source: DPDP
+    title: "Digital Personal Data Protection Act, 2023"
+    effective_date: "2023-08-11"
+    expiry_date: null
+    mandatory: true
+    subject: "Data Fiduciaries processing digital personal data of Indian residents"
+    domain: data_protection
+    summary: "Comprehensive data protection: consent, purpose limitation, data minimisation, data principal rights, breach notification."
+    clauses:
+      - "Section 4 — Grounds for Processing: Consent or legitimate use"
+      - "Section 5 — Notice: Clear notice before processing; in English or scheduled language"
+      - "Section 6 — Consent: Specific, informed, unconditional consent; right to withdraw"
+      - "Section 8 — Obligations of Data Fiduciary: Accuracy, completeness, security safeguards"
+      - "Section 9 — Processing Children's Data: Verifiable parental consent; no behavioural targeting"
+      - "Section 10 — Significant Data Fiduciary: Additional obligations (DPIA, data auditor)"
+      - "Section 17 — Breach Notification: Notify Data Protection Board and data principals of breaches"
+      - "Section 33 — Penalty: Up to INR 250 crore per incident for breach of Section 8"
+    penalty_severity: HIGH
+
+  - id: dpdp_retention_conflict
+    reg_id: "DPDP-2023-S8-Retention"
+    source: DPDP
+    title: "DPDP Act — Data Retention Limitation (Section 8(7))"
+    effective_date: "2023-08-11"
+    expiry_date: null
+    mandatory: true
+    subject: "Data Fiduciaries"
+    domain: data_protection
+    summary: "Personal data must be erased when the purpose of processing is no longer served or consent is withdrawn."
+    clauses:
+      - "Section 8(7) — Erasure: Data must not be retained beyond purpose or legal requirement"
+    penalty_severity: HIGH
+
+  # ─────────────────────────────────────────────────────────────────────────
+  # Basel III (as adopted by RBI)
+  # ─────────────────────────────────────────────────────────────────────────
+
+  - id: basel_cet1_requirement
+    reg_id: "Basel III — CET1 Framework (BIS 2011 / RBI adoption 2015)"
+    source: BASEL
+    title: "Basel III Common Equity Tier 1 Capital Requirement"
+    effective_date: "2015-01-01"
+    expiry_date: null
+    mandatory: true
+    subject: "Banks subject to RBI capital regulations"
+    domain: capital
+    summary: "CET1 minimum requirement: 4.5% globally; RBI mandates 5.5%."
+    clauses:
+      - "Para 52 — CET1 Definition: Paid-up equity, retained earnings, other comprehensive income"
+      - "Para 53 — Minimum Ratio: 4.5% of RWA (BIS); RBI circular raises to 5.5%"
+      - "Para 59 — Deductions: Intangibles, deferred tax, minority interests deducted from CET1"
+    penalty_severity: HIGH
+
+  - id: basel_lcr_standard
+    reg_id: "Basel III — LCR Standard (BIS 2013)"
+    source: BASEL
+    title: "Basel III Liquidity Coverage Ratio"
+    effective_date: "2015-01-01"
+    expiry_date: null
+    mandatory: true
+    subject: "Banks subject to RBI capital regulations"
+    domain: liquidity
+    summary: "LCR: banks must hold sufficient HQLA to survive 30-day stress scenario. 100% minimum."
+    clauses:
+      - "Para 22 — LCR Minimum: 100% of net cash outflows over 30-day stress"
+      - "Para 31 — HQLA Definition: Level 1 (0% haircut) and Level 2 (15-50% haircut) assets"
+      - "Para 44 — Run-off Rates: Retail deposits 3-10%; internet deposits up to 10%"
+    penalty_severity: HIGH
+
+# =============================================================================
+# EDGES — Relationships between regulatory nodes
+# =============================================================================
+
+edges:
+
+  # ── SUPERSEDES ─────────────────────────────────────────────────────────────
+
+  - source_id: rbi_it_framework_2023
+    target_id: rbi_it_framework_2019
+    edge_type: SUPERSEDES
+    effective_date: "2024-04-01"
+    notes: "The 2023 Master Direction fully supersedes the 2019 NBFC IT framework and extends scope to all scheduled banks. AES-256 replaces AES-128 minimum."
+
+  - source_id: certin_directions_2022
+    target_id: certin_old_reporting_2014
+    edge_type: SUPERSEDES
+    effective_date: "2022-04-28"
+    notes: "CERT-In 2022 Directions reduce incident reporting window from 72 hours to 6 hours, adding VPN log retention and NTP sync requirements."
+
+  - source_id: rbi_cyber_resilience_2024
+    target_id: rbi_it_framework_2023
+    edge_type: RELATED_TO
+    effective_date: "2024-07-31"
+    notes: "Cyber Resilience 2024 extends and specialises the IT Framework 2023 for digital payment systems specifically."
+
+  - source_id: rbi_lcr_2024
+    target_id: basel_lcr_standard
+    edge_type: SUPERSEDES
+    effective_date: "2025-04-01"
+    notes: "RBI 2024 LCR amendment raises run-off rate for internet-sourced retail deposits beyond Basel III baseline (15% vs 10%), reflecting India-specific digital banking risk."
+
+  # ── CONFLICTS_WITH ─────────────────────────────────────────────────────────
+
+  - source_id: dpdp_retention_conflict
+    target_id: rbi_aml_cft_2023
+    edge_type: CONFLICTS_WITH
+    effective_date: "2023-08-11"
+    notes: "DPDP Section 8(7) requires erasure of personal data when purpose ends. RBI AML/CFT Section 7 mandates 5-year retention of KYC and transaction records. Conflict: AML retention obligation creates lawful basis under DPDP Section 4 (legitimate use), but scope must be strictly defined."
+
+  - source_id: dpdp_retention_conflict
+    target_id: rbi_data_retention_2021
+    edge_type: CONFLICTS_WITH
+    effective_date: "2023-08-11"
+    notes: "Digital Lending Guidelines require 5-year transaction data retention. DPDP imposes erasure once purpose is served. Conflict resolved by DPDP Section 8(7) exception: retention permitted where required by law."
+
+  - source_id: rbi_it_framework_2023
+    target_id: rbi_it_framework_2019
+    edge_type: CONFLICTS_WITH
+    effective_date: "2024-04-01"
+    notes: "Encryption standard conflict: old framework allowed AES-128 minimum, new framework mandates AES-256. Systems complying with old standard are now non-compliant."
+
+  # ── IMPLEMENTS ─────────────────────────────────────────────────────────────
+
+  - source_id: rbi_capital_adequacy_2023
+    target_id: basel_cet1_requirement
+    edge_type: IMPLEMENTS
+    effective_date: "2023-04-01"
+    notes: "RBI Master Circular implements Basel III CET1 with a higher minimum (5.5% vs BIS 4.5%) and adds CCB requirement of 2.5%."
+
+  - source_id: rbi_lcr_2024
+    target_id: basel_lcr_standard
+    edge_type: IMPLEMENTS
+    effective_date: "2025-04-01"
+    notes: "RBI LCR amendment implements Basel LCR standard with India-specific calibration of run-off rates."
+
+  - source_id: rbi_aml_cft_2023
+    target_id: sebi_aml_2023
+    edge_type: RELATED_TO
+    effective_date: "2023-01-01"
+    notes: "SEBI AML master circular aligns with RBI AML/CFT framework — both derive from FATF recommendations and PMLA 2002."
+
+  # ── DEPENDS_ON ─────────────────────────────────────────────────────────────
+
+  - source_id: rbi_kyc_master_2016
+    target_id: rbi_aml_cft_2023
+    edge_type: DEPENDS_ON
+    effective_date: "2023-04-01"
+    notes: "KYC is a prerequisite for AML compliance. CDD/EDD procedures established in KYC directions form the foundation of AML controls."
+
+  - source_id: rbi_cyber_resilience_2024
+    target_id: certin_directions_2022
+    edge_type: DEPENDS_ON
+    effective_date: "2024-07-31"
+    notes: "RBI cyber resilience mandates CERT-In incident reporting compliance. Banks must report to both RBI (6-hour) and CERT-In (6-hour) in parallel."
+
+  - source_id: sebi_cyber_2023
+    target_id: certin_directions_2022
+    edge_type: DEPENDS_ON
+    effective_date: "2023-08-20"
+    notes: "SEBI Cyber framework requires VAPT by CERT-In empanelled auditors and mandates CERT-In incident reporting."
+
+  - source_id: rbi_outsourcing_2023
+    target_id: rbi_it_framework_2023
+    edge_type: DEPENDS_ON
+    effective_date: "2023-10-01"
+    notes: "Outsourcing IT services must comply with IT Framework encryption and security standards — the IT Framework is a prerequisite for outsourcing compliance."
+
+  # ── EQUIVALENT_TO ──────────────────────────────────────────────────────────
+
+  - source_id: rbi_cyber_resilience_2024
+    target_id: sebi_cyber_2023
+    edge_type: EQUIVALENT_TO
+    effective_date: "2024-07-31"
+    notes: "Both frameworks mandate 6-hour incident reporting, bi-annual VAPT by CERT-In empanelled auditors, AES-256 encryption, and 24x7 SOC. Institutions regulated by both RBI and SEBI must satisfy the stricter of the two controls."

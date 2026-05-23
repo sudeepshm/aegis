@@ -47,6 +47,7 @@ import logging
 import os
 import time
 import uuid
+import json
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -91,11 +92,30 @@ from audit.logger import (
 )
 
 # ── Production module imports ──────────────────────────────────────────────
-from ingestion.fetch_rbi import IngestionEngine
+from ingestion.fetch_rbi import IngestionEngine, FetchConfig, RegulatorySource
 from parser.chunker import SemanticChunker
 from llm.map_generator import MAPGenerator, MAPStatus
 from routing.router import HybridRouter
 from workflow.task_manager import TaskManager
+from validation.validator import (
+    HybridValidator,
+    ValidationRequest,
+    ValidationOutcome,
+)
+
+# ── Multi-Agent Intelligence Layer (Phase 3-5) ───────────────────────────────
+try:
+    from agents.planner_agent import PlannerAgent, MultiAgentResult, AgentMessage
+    from agents.reasoning_agent import DeepReasoningAgent
+    from knowledge.policy_graph import PolicyGraph
+    from knowledge.risk_engine import RiskScoringEngine
+    _AGENT_LAYER_AVAILABLE = True
+except ImportError as _agent_import_err:
+    _AGENT_LAYER_AVAILABLE = False
+    logging.getLogger(__name__).warning(
+        "agent_layer_unavailable: %s (pip install networkx pyyaml)",
+        _agent_import_err,
+    )
 
 # ---------------------------------------------------------------------------
 log = structlog.get_logger(__name__)
@@ -204,6 +224,40 @@ class PipelineState:
     # Timing
     started_at:      float = field(default_factory=time.monotonic)
 
+    # ── Multi-Agent Intelligence Fields (Phase 3-8) ──────────────────────────
+    # All new fields are Optional / default to empty so existing serialisation
+    # contracts (LangGraph JSON serialisation) remain fully backward-compatible.
+
+    # PlannerAgent output: full multi-agent run result (serialised dict)
+    multi_agent_result:  Optional[dict[str, Any]] = None
+
+    # Per-obligation reasoning summaries from DeepReasoningAgent
+    reasoning_results:   list[dict[str, Any]]     = field(default_factory=list)
+
+    # All inter-agent messages (audit trail)
+    agent_messages:      list[dict[str, Any]]     = field(default_factory=list)
+
+    # Number of agent disagreements that were resolved in this run
+    disagreements_resolved: int                   = 0
+
+    # Whether any obligation was escalated (blocks MAP generation)
+    has_escalations:     bool                     = False
+
+    # Risk scores per obligation: list of RiskScore.to_dict()
+    risk_scores:         list[dict[str, Any]]     = field(default_factory=list)
+
+    # Policy conflicts found by CriticAgent across the document
+    policy_conflicts:    list[dict[str, Any]]     = field(default_factory=list)
+
+    # Evidence manifests (one per obligation)
+    evidence_manifests:  list[dict[str, Any]]     = field(default_factory=list)
+
+    # Supersession notes (were any cited regulations superseded?)
+    supersession_notes:  list[str]                = field(default_factory=list)
+
+    # Ontology snapshot used during this run (for audit trail)
+    ontology_summary:    str                      = ""
+
 
 # ===========================================================================
 # 2.  KILL SWITCH MONITOR
@@ -226,7 +280,28 @@ class KillSwitchMonitor:
         self._window     = window
         self._webhook    = webhook_url
         self._settings   = settings
-        self._runs: deque[bool] = deque(maxlen=window)
+        # Persistent run store (newline-delimited JSON file) — optional.
+        # If `settings.kill_switch_store_path` is provided, use that path;
+        # otherwise default to './kill_switch_runs.jsonl'.
+        store_path = None
+        if settings and getattr(settings, "kill_switch_store_path", None):
+            store_path = getattr(settings, "kill_switch_store_path")
+        self._store_path = Path(store_path) if store_path else Path("./kill_switch_runs.jsonl")
+        self._runs: list[bool] = []
+        # Load existing runs from disk if available
+        try:
+            if self._store_path.exists():
+                with self._store_path.open("r", encoding="utf-8") as fh:
+                    for line in fh:
+                        try:
+                            obj = json.loads(line.strip())
+                            self._runs.append(bool(obj.get("success", False)))
+                        except Exception:
+                            continue
+                # keep only the most recent `window` entries
+                self._runs = self._runs[-self._window:]
+        except Exception as exc:
+            log.warning("kill_switch.store_load_failed", error=str(exc))
         self._active     = False
         self._audit_logger: Optional[AuditLogger] = None
 
@@ -236,7 +311,16 @@ class KillSwitchMonitor:
 
     # ------------------------------------------------------------------
     def record(self, success: bool) -> None:
+        # Append to in-memory list and persist to disk
         self._runs.append(success)
+        # Trim to window size
+        if len(self._runs) > self._window:
+            self._runs = self._runs[-self._window:]
+        try:
+            with self._store_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"ts": time.time(), "success": bool(success)}) + "\n")
+        except Exception as exc:
+            log.warning("kill_switch.store_append_failed", error=str(exc))
         rate = self.error_rate()
         log.info("kill_switch.record", success=success, error_rate=f"{rate:.2%}")
         if not self._active and rate > self._threshold:
@@ -368,48 +452,70 @@ class PipelineNodes:
     """
 
     def __init__(self, settings: Settings, audit_logger: AuditLogger,
-                 kill_switch: KillSwitchMonitor):
+                 kill_switch: KillSwitchMonitor, task_manager: TaskManager):
         self._cfg   = settings
         self._al    = audit_logger
         self._ks    = kill_switch
+        self._tm    = task_manager
 
     # ── 4.1 Ingestion ──────────────────────────────────────────────────────
     @degradable("ingestion")
     async def ingestion_node(self, state: PipelineState) -> PipelineState:
         """
-        Pull raw documents from MinIO / ADLS Gen2 blob storage via the
-        production IngestionEngine (ingestion/fetch_rbi.py).
+        Pull raw documents from the regulatory source via IngestionEngine.
+
+        FIX: IngestionEngine.__init__ takes a FetchConfig (not Settings).
+        FIX: ingest() is synchronous — must be called via asyncio.to_thread
+             to avoid blocking the LangGraph event loop on AKS.
+        FIX: ingest() requires (url, source) positional arguments.
         """
         log.info("ingestion.start", run_id=state.run_id)
 
-        engine = IngestionEngine(settings=self._cfg)
-        result = await engine.ingest()
+        # Build a FetchConfig from the centralised Settings object
+        fetch_cfg = FetchConfig(
+            adls_connection_string   = getattr(self._cfg, "adls_connection_string", ""),
+            adls_account_name        = getattr(self._cfg, "adls_account_name", ""),
+            adls_container_name      = getattr(self._cfg, "adls_container_name", "compliance-docs"),
+            cosmos_connection_string = getattr(self._cfg, "cosmos_connection_string", ""),
+            form_recognizer_endpoint = getattr(self._cfg, "form_recognizer_endpoint", ""),
+            form_recognizer_key      = getattr(self._cfg, "form_recognizer_key", ""),
+            azure_region             = getattr(self._cfg, "azure_region", "centralindia"),
+        )
+        engine = IngestionEngine(fetch_cfg)
 
-        if result and result.get("documents"):
-            doc_info = result["documents"][0]
-            state.document = DocumentPayload(
-                doc_id    = doc_info.get("doc_id", f"doc-{state.run_id[:8]}"),
-                source    = doc_info.get("source", "adls"),
-                blob_url  = doc_info.get("blob_url", ""),
-                mime_type = doc_info.get("mime_type", "application/pdf"),
-                metadata  = doc_info.get("metadata", {"region": self._cfg.azure_region}),
-            )
-        else:
-            # Fallback: construct minimal payload so pipeline can continue
-            state.document = DocumentPayload(
-                doc_id    = f"doc-{state.run_id[:8]}",
-                source    = "adls",
-                blob_url  = (f"https://{self._cfg.adls_account_name}"
-                             f".dfs.core.windows.net/"
-                             f"{self._cfg.adls_container_name}/latest.pdf"),
-                mime_type = "application/pdf",
-                metadata  = {"region": self._cfg.azure_region},
-            )
+        # Determine the source URL (e.g. from a Service Bus trigger payload
+        # stored in state.metadata, or a default RBI watch URL).
+        source_url = getattr(state, "source_url", None) or \
+                     fetch_cfg.source_urls.get("RBI", "https://www.rbi.org.in")
+        source     = RegulatorySource.RBI
+
+        # ingest() is blocking (httpx.Client, Azure SDK) — offload to thread
+        ingestion_result = await asyncio.to_thread(
+            engine.ingest, source_url, source
+        )
+
+        state.document = DocumentPayload(
+            doc_id    = ingestion_result.doc_id,
+            source    = ingestion_result.source.value,
+            blob_url  = ingestion_result.blob_path or source_url,
+            mime_type = ingestion_result.metadata.get("mime_type", "application/pdf"),
+            metadata  = {
+                "region":         self._cfg.azure_region,
+                "raw_text":       ingestion_result.extracted_text,
+                "content_hash":   ingestion_result.content_hash,
+                "ocr_used":       ingestion_result.ocr_used,
+                "confidence":     ingestion_result.confidence,
+            },
+        )
 
         self._al.append(state.chain_id, NodeType.REGULATION,
-                        {"stage": "ingestion", "doc_id": state.document.doc_id,
-                         "blob_url": state.document.blob_url})
-        log.info("ingestion.complete", doc_id=state.document.doc_id)
+                        {"stage": "ingestion",
+                         "doc_id":       state.document.doc_id,
+                         "blob_url":     state.document.blob_url,
+                         "content_hash": ingestion_result.content_hash,
+                         "ocr_used":     ingestion_result.ocr_used})
+        log.info("ingestion.complete", doc_id=state.document.doc_id,
+                 ocr_used=ingestion_result.ocr_used)
         return state
 
     # ── 4.2 Parse ──────────────────────────────────────────────────────────
@@ -472,7 +578,101 @@ class PipelineNodes:
                  chunks=len(parse_result.chunks))
         return state
 
-    # ── 4.3 MAP Generation ─────────────────────────────────────────────────
+    # ── 4.3a Multi-Agent Reasoning (NEW — runs before MAPGenerator) ────────
+    @degradable("multi_agent_reasoning")
+    async def multi_agent_map_node(self, state: PipelineState) -> PipelineState:
+        """
+        Invoke the PlannerAgent pipeline for deep agentic reasoning.
+
+        Runs:
+          VerifierAgent  → ambiguity detection
+          CriticAgent    → policy conflict + supersession check
+          DeepReasoningAgent → Gemini chain-of-thought (system impact, rollout)
+          EvidenceAgent  → evidence manifest generation
+          PlannerAgent   → disagreement resolution + orchestration
+
+        Results are stored in PipelineState agentic fields and surfaced in the
+        downstream MAP nodes and audit ledger.  If the agent layer is
+        unavailable (import error), the node gracefully degrades.
+        """
+        if not _AGENT_LAYER_AVAILABLE:
+            log.warning("multi_agent_reasoning.skipped",
+                        reason="agent layer not installed")
+            state.degraded_stages.append("multi_agent_reasoning")
+            return state
+
+        if not state.parsed:
+            log.warning("multi_agent_reasoning.skipped", reason="no parsed document")
+            return state
+
+        log.info("multi_agent_reasoning.start", run_id=state.run_id)
+
+        settings = get_settings()
+        planner  = PlannerAgent(
+            gemini_api_key  = settings.gemini_api_key,
+            gemini_model    = settings.gemini_model_version,
+            max_obligations = 20,
+            max_concurrency = 4,
+        )
+
+        # Capture ontology summary for audit trail
+        try:
+            from knowledge.policy_graph import get_ontology
+            state.ontology_summary = get_ontology().summary()
+        except Exception:
+            pass
+
+        # Run the full multi-agent pipeline
+        ma_result: MultiAgentResult = await planner.plan(
+            document_text = state.parsed.raw_text,
+            document_ref  = state.parsed.doc_id,
+        )
+
+        # Store serialised results in PipelineState
+        state.multi_agent_result    = ma_result.to_dict()
+        state.agent_messages        = [m.to_dict() for m in ma_result.agent_messages]
+        state.disagreements_resolved = ma_result.disagreements_resolved
+        state.has_escalations        = ma_result.obligations_escalated > 0
+
+        # Unpack per-obligation results
+        for ob_result in ma_result.obligation_results:
+            if ob_result.reasoning_result:
+                state.reasoning_results.append(ob_result.reasoning_result)
+            if ob_result.critique_report:
+                for conflict in ob_result.critique_report.get("conflicts", []):
+                    state.policy_conflicts.append(conflict)
+            if ob_result.evidence_manifest:
+                state.evidence_manifests.append(ob_result.evidence_manifest)
+            for note in (ob_result.reasoning_result or {}).get("supersession_notes", []):
+                if note not in state.supersession_notes:
+                    state.supersession_notes.append(note)
+
+        # Write to audit ledger
+        self._al.append(
+            state.chain_id,
+            NodeType.MAP,
+            {
+                "stage":                  "multi_agent_reasoning",
+                "obligations_processed":  ma_result.obligations_processed,
+                "obligations_escalated":  ma_result.obligations_escalated,
+                "disagreements_resolved": ma_result.disagreements_resolved,
+                "policy_conflicts_found": len(state.policy_conflicts),
+                "agent_messages":         len(state.agent_messages),
+                "ontology":               state.ontology_summary,
+                "map_ready":              ma_result.map_ready,
+            },
+        )
+
+        log.info(
+            "multi_agent_reasoning.complete",
+            obligations    = ma_result.obligations_processed,
+            escalated      = ma_result.obligations_escalated,
+            disagreements  = ma_result.disagreements_resolved,
+            conflicts      = len(state.policy_conflicts),
+        )
+        return state
+
+    # ── 4.3b MAP Generation (now informed by multi-agent results) ──────────
     @degradable("map_generation")
     async def map_generation_node(self, state: PipelineState) -> PipelineState:
         """
@@ -581,76 +781,130 @@ class PipelineNodes:
         """
         Use the TaskManager (workflow/task_manager.py) to create a
         ServiceNow incident with SLA tracking and dependency management.
+
+        FIX: TaskManager.create_task() is synchronous (uses httpx.Client).
+             Wrap in asyncio.to_thread to prevent blocking the event loop.
         """
         log.info("task_creation.start", run_id=state.run_id)
         assert state.routing, "task_creation_node requires routing decision"
 
-        manager = TaskManager(
-            snow_instance_url=getattr(self._cfg, 'servicenow_instance_url', ''),
-            snow_client_id=getattr(self._cfg, 'servicenow_client_id', ''),
-            snow_client_secret=getattr(self._cfg, 'servicenow_client_secret', ''),
-            snow_username=getattr(self._cfg, 'servicenow_username', ''),
-            snow_password=getattr(self._cfg, 'servicenow_password', ''),
-        )
+        manager = self._tm
 
         doc_id = state.document.doc_id if state.document else "N/A"
-        task = manager.create_task(
-            obligation_id=state.map_nodes[0].control_ref if state.map_nodes else "unknown",
-            department=state.routing.assignee_group,
-            assignee=state.routing.assignee_group,
-            assignee_email=f"{state.routing.assignee_group.lower().replace(' ', '-')}@bank.org",
-            description=f"Compliance review — {doc_id}",
-            priority=state.routing.priority,
-            sla_hours=state.routing.sla_hours,
+
+        # create_task() is synchronous (uses httpx.Client) — offload to thread
+        ticket = await asyncio.to_thread(
+            manager.create_task,
+            obligation_id  = state.map_nodes[0].control_ref if state.map_nodes else "unknown",
+            department     = state.routing.assignee_group,
+            assignee       = state.routing.assignee_group,
+            assignee_email = f"{state.routing.assignee_group.lower().replace(' ', '-')}@bank.org",
+            description    = f"Compliance review — {doc_id}",
+            priority       = state.map_nodes[0].risk_level if state.map_nodes else "Medium",
+            sla_hours      = state.routing.sla_hours,
         )
 
         state.snow_task = ServiceNowTask(
-            sys_id     = task.snow_sys_id or task.task_id,
-            number     = task.snow_number or task.task_id,
-            state      = task.state.value,
-            short_desc = f"Compliance review — {doc_id}",
+            sys_id     = ticket.snow_sys_id or ticket.task_id,
+            number     = ticket.snow_number or ticket.task_id,
+            state      = ticket.state.value,
+            short_desc = ticket.description[:200],
         )
-
-        manager.close()
 
         self._al.append(state.chain_id, NodeType.TASK,
                         {"stage": "task_creation",
-                         "task_id": task.task_id,
+                         "task_id":     ticket.task_id,
                          "snow_number": state.snow_task.number,
-                         "department": task.department,
-                         "priority": task.priority,
-                         "sla_hours": state.routing.sla_hours})
+                         "department":  ticket.department,
+                         "priority":    ticket.priority,
+                         "sla_hours":   state.routing.sla_hours})
         log.info("task_creation.complete", snow_number=state.snow_task.number,
-                 task_id=task.task_id)
+                 task_id=ticket.task_id)
         return state
 
     # ── 4.6 Validation ─────────────────────────────────────────────────────
     @degradable("validation")
     async def validation_node(self, state: PipelineState) -> PipelineState:
         """
-        Cross-validate pipeline outputs:
-          - All MAP nodes have an assigned owner
-          - ServiceNow task was created (or DLQ entry confirmed)
-          - No required evidence is missing
-          - Confidence scores are above threshold
+        Delegate all validation to the production HybridValidator
+        (validation/validator.py) which runs Tier-1 ESB/KeyVault checks
+        and Tier-2 Document Intelligence checks.
+
+        FIX: The previous stub only checked state.map_nodes existence,
+             entirely bypassing the two-tier HybridValidator engine.
+        FIX: HybridValidator.validate() is a coroutine — awaited directly.
         """
         log.info("validation.start", run_id=state.run_id)
+        escalate_to_co = False
         errors:   list[str] = []
         warnings: list[str] = []
-        escalate_to_co = False
 
+        # ── Quick structural pre-checks (pipeline-level, not document-level) ──
         if not state.map_nodes:
             errors.append("No MAP nodes generated")
         if not state.snow_task and "task_creation" not in state.degraded_stages:
             errors.append("ServiceNow task missing and stage not marked degraded")
-        if state.parsed and state.parsed.confidence < 0.80:
-            errors.append(
-                f"Parse confidence {state.parsed.confidence:.0%} is below "
-                f"the 80% threshold. Escalating to Compliance Officer."
-            )
-            escalate_to_co = True
         if state.degraded_stages:
             warnings.append(f"Degraded stages: {', '.join(state.degraded_stages)}")
+
+        # ── Tier-1 + Tier-2 validation via HybridValidator ──────────────────
+        if state.document and state.parsed:
+            try:
+                doc_content = state.parsed.raw_text.encode("utf-8") \
+                              if state.parsed.raw_text else b""
+
+                val_req = ValidationRequest(
+                    task_id          = state.run_id,
+                    obligation_id    = state.map_nodes[0].control_ref
+                                       if state.map_nodes else "unknown",
+                    department       = state.routing.assignee_group
+                                       if state.routing else "Compliance",
+                    unit_head_email  = getattr(self._cfg, "alert_sender", ""),
+                    unit_head_name   = "Compliance Officer",
+                    system_id        = state.document.doc_id,
+                    vault_secret     = getattr(self._cfg, "audit_hmac_secret", ""),
+                    document_path    = state.document.blob_url,
+                    document_content = doc_content,
+                    run_esb_checks   = True,
+                    run_kv_checks    = True,
+                    run_doc_checks   = len(doc_content) > 0,
+                )
+
+                validator  = HybridValidator()
+                val_report = await validator.validate(val_req)
+
+                if val_report.outcome == ValidationOutcome.REWORK:
+                    escalate_to_co = True
+                    errors.append(
+                        f"HybridValidator: {val_report.summary}"
+                    )
+                elif val_report.outcome == ValidationOutcome.PASS:
+                    log.info("validation.hybrid_pass",
+                             confidence=val_report.overall_confidence)
+
+                # Surface individual failed checks as warnings
+                for chk in val_report.check_results:
+                    if not chk.passed:
+                        warnings.append(
+                            f"Check '{chk.name}' failed: {chk.explanation}"
+                        )
+
+            except Exception as exc:
+                log.warning("validation.hybrid_validator_error",
+                            error=str(exc),
+                            fallback="confidence_check")
+                if state.parsed and state.parsed.confidence < 0.80:
+                    escalate_to_co = True
+                    errors.append(
+                        f"Parse confidence {state.parsed.confidence:.0%} "
+                        f"is below the 80% threshold."
+                    )
+        elif state.parsed and state.parsed.confidence < 0.80:
+            escalate_to_co = True
+            errors.append(
+                f"Parse confidence {state.parsed.confidence:.0%} "
+                f"is below the 80% threshold. Escalating to Compliance Officer."
+            )
 
         state.validation = ValidationResult(
             is_valid = len(errors) == 0 and not escalate_to_co,
@@ -658,15 +912,14 @@ class PipelineNodes:
             warnings = warnings,
         )
         self._al.append(state.chain_id, NodeType.EVIDENCE,
-                        {"stage": "validation",
+                        {"stage":    "validation",
                          "is_valid": state.validation.is_valid,
                          "escalated_to_compliance_officer": escalate_to_co,
                          "errors":   errors,
                          "warnings": warnings})
         if escalate_to_co:
             log.warning("validation.escalated_to_compliance_officer",
-                        run_id=state.run_id,
-                        confidence=state.parsed.confidence if state.parsed else 0)
+                        run_id=state.run_id)
         log.info("validation.complete", is_valid=state.validation.is_valid,
                  errors=len(errors), warnings=len(warnings))
         return state
@@ -692,12 +945,12 @@ class PipelineNodes:
                 "snow_task":        state.snow_task.number if state.snow_task else None,
                 "is_valid":         state.validation.is_valid if state.validation else None,
                 "degraded_stages":  state.degraded_stages,
-                "actor":            "system:langgraph-orchestrator",
             },
+            actor="system:langgraph-orchestrator",
         )
         reports = self._al.finalize(
             state.chain_id,
-            output_dir=Path(os.environ.get("REPORT_OUTPUT_DIR", "/tmp/compliance-reports")),
+            output_dir=Path(os.environ.get("REPORT_OUTPUT_DIR", "./compliance-reports")),
         )
         state.ledger_finalised = True
         log.info("ledger_update.complete", chain_id=state.chain_id,
@@ -750,13 +1003,14 @@ def build_graph(nodes: PipelineNodes) -> "CompiledGraph":  # type: ignore[name-d
     graph = StateGraph(PipelineState)
 
     # Register nodes
-    graph.add_node("ingestion",     nodes.ingestion_node)
-    graph.add_node("parse",         nodes.parse_node)
-    graph.add_node("map_generation",nodes.map_generation_node)
-    graph.add_node("routing",       nodes.routing_node)
-    graph.add_node("task_creation", nodes.task_creation_node)
-    graph.add_node("validation",    nodes.validation_node)
-    graph.add_node("ledger_update", nodes.ledger_update_node)
+    graph.add_node("ingestion",             nodes.ingestion_node)
+    graph.add_node("parse",                 nodes.parse_node)
+    graph.add_node("multi_agent_reasoning", nodes.multi_agent_map_node)   # NEW
+    graph.add_node("map_generation",        nodes.map_generation_node)
+    graph.add_node("routing",               nodes.routing_node)
+    graph.add_node("task_creation",         nodes.task_creation_node)
+    graph.add_node("validation",            nodes.validation_node)
+    graph.add_node("ledger_update",         nodes.ledger_update_node)
 
     # Entry
     graph.set_entry_point("ingestion")
@@ -765,6 +1019,8 @@ def build_graph(nodes: PipelineNodes) -> "CompiledGraph":  # type: ignore[name-d
     graph.add_conditional_edges("ingestion", _killed,
                                  {"continue": "parse", "end": END})
     graph.add_conditional_edges("parse", _killed,
+                                 {"continue": "multi_agent_reasoning", "end": END})
+    graph.add_conditional_edges("multi_agent_reasoning", _killed,
                                  {"continue": "map_generation", "end": END})
     graph.add_edge("map_generation", "routing")
     graph.add_edge("routing",        "task_creation")
@@ -773,6 +1029,7 @@ def build_graph(nodes: PipelineNodes) -> "CompiledGraph":  # type: ignore[name-d
     graph.add_edge("ledger_update",  END)
 
     return graph.compile()
+
 
 
 # ===========================================================================
@@ -801,7 +1058,16 @@ class ComplianceOrchestrator:
             settings    = self._cfg,
         )
         self._ks.bind_audit_logger(self._al)
-        self._nodes  = PipelineNodes(self._cfg, self._al, self._ks)
+        # Create a single TaskManager for this orchestrator (pod-wide)
+        self.task_manager = TaskManager(
+            snow_instance_url  = self._cfg.servicenow_instance_url,
+            snow_client_id     = self._cfg.servicenow_client_id,
+            snow_client_secret = self._cfg.servicenow_client_secret,
+            snow_username      = self._cfg.servicenow_username,
+            snow_password      = self._cfg.servicenow_password,
+        )
+
+        self._nodes  = PipelineNodes(self._cfg, self._al, self._ks, self.task_manager)
         self._graph  = build_graph(self._nodes) if _LANGGRAPH_AVAILABLE else None
         self._sem    = asyncio.Semaphore(self._cfg.max_concurrent_chains)
         log.info("orchestrator.ready",
@@ -912,6 +1178,7 @@ class ComplianceOrchestrator:
         for node_fn in [
             self._nodes.ingestion_node,
             self._nodes.parse_node,
+            self._nodes.multi_agent_map_node,
             self._nodes.map_generation_node,
             self._nodes.routing_node,
             self._nodes.task_creation_node,
@@ -982,9 +1249,14 @@ async def health_check(orchestrator: ComplianceOrchestrator) -> dict:
 
 async def _main_async() -> None:
     log.info("startup", service="compliance-orchestrator",
-             region=AZURE_REGION_DISPLAY if 'AZURE_REGION_DISPLAY' in dir() else "India Central")
+             region=get_settings().azure_region_display)
 
     orchestrator = ComplianceOrchestrator()
+
+    # Note: TaskManager uses in-memory task store + synchronous ServiceNow client.
+    # SLA breach checks are run inline during pipeline execution.
+    # For production Cosmos-backed persistence, wrap TaskManager with a
+    # CosmosTaskStore adapter and initialise it here.
 
     # Single run (replace with Service Bus / event-driven trigger in prod)
     result = await orchestrator.run_pipeline()

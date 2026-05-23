@@ -45,3 +45,10 @@ opencensus-ext-azure>=1.1.0
 
 # ── Utilities ───────────────────────────────────────────────────────────────
 tzdata>=2023.3
+
+# ── Knowledge Graph / Agentic Intelligence Layer ─────────────────────────────
+networkx>=3.3.0            # ComplianceOntology — regulatory graph engine
+PyYAML>=6.0.1              # regulations.yaml seed loader
+scikit-learn>=1.4.0        # AnomalyDetector (IsolationForest)
+pytesseract>=0.3.10        # ScreenshotOCRVerifier — OCR on evidence screenshots
+Pillow>=10.3.0             # Image processing for OCR pipeline
