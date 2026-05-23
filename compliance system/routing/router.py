@@ -369,7 +369,6 @@ class MLClassifier:
                 class_weight="balanced",
                 C=1.5,
                 solver="lbfgs",
-                multi_class="multinomial",
             )),
         ])
         self._classes: list[str] = []
@@ -430,6 +429,15 @@ class RoutedTask:
     depends_on:       list[str]       # task_ids this task is blocked by
     dependency_note:  str | None      # human-readable dependency rationale
     created_at:       str
+    metadata:         dict = field(default_factory=dict)
+
+    @property
+    def confidence(self) -> float:
+        return self.final_confidence
+
+    @confidence.setter
+    def confidence(self, val: float) -> None:
+        self.final_confidence = val
 
     def to_dict(self) -> dict:
         return {
@@ -456,6 +464,7 @@ class RoutedTask:
             "depends_on":       self.depends_on,
             "dependency_note":  self.dependency_note,
             "created_at":       self.created_at,
+            "metadata":         self.metadata,
         }
 
 
@@ -673,12 +682,13 @@ class HybridRouter:
         print(result.to_dict())
     """
 
-    def __init__(self) -> None:
+    def __init__(self, correction_ledger: Optional[Any] = None) -> None:
         self._rule_engine    = RuleEngine()
         self._ml_classifier  = MLClassifier()
         self._hierarchy      = HierarchyResolver()
         self._cross_func     = CrossFunctionalResolver()
         self._exception_hdlr = ExceptionHandler(self._hierarchy)
+        self._correction_ledger = correction_ledger
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -811,6 +821,92 @@ class HybridRouter:
             is_unassigned=False,
             router_notes=notes,
         )
+
+    async def route_with_corrections(
+        self,
+        obligation_id: str,
+        text: str,
+        domain: str,
+        regulation_ref: str,
+    ) -> RoutedTask:
+        """
+        Route a single directive text with human-in-the-loop correction support.
+        Queries the correction ledger; if a past CCO override matches the
+        domain and regulation reference, uses the corrected department with
+        a high confidence score.
+        """
+        corrections = []
+        if self._correction_ledger:
+            try:
+                corrections = await self._correction_ledger.get_recent_corrections(
+                    domain=domain, regulation_ref=regulation_ref
+                )
+            except Exception as exc:
+                logger.error("Failed to query ledger corrections in router: %s", exc)
+
+        if corrections:
+            latest = corrections[0]
+            corrected_val = latest.get("corrected_value", {})
+            if isinstance(corrected_val, dict) and "department" in corrected_val:
+                corrected_dept_str = corrected_val["department"]
+                try:
+                    dept = Department(corrected_dept_str)
+                except ValueError:
+                    dept = Department.COMPLIANCE
+
+                unit_head, sub_unit = self._hierarchy.resolve(dept)
+                raci = self._hierarchy.build_raci(dept, unit_head, sub_unit)
+
+                task = RoutedTask(
+                    task_id=_new_id(),
+                    obligation_id=obligation_id,
+                    department=dept,
+                    unit_head=unit_head,
+                    sub_unit=sub_unit,
+                    directive_text=text,
+                    routing_method="ledger_corrected",
+                    rule_confidence=0.0,
+                    ml_confidence=0.0,
+                    final_confidence=0.95,
+                    status=TaskStatus.PENDING,
+                    raci=raci,
+                    depends_on=[],
+                    dependency_note=None,
+                    created_at=_now(),
+                )
+                task.metadata = {"correction_id": latest.get("correction_id", "")}
+                return task
+
+        # Fallback to standard routing
+        res = self.route(directive_text=text, obligation_id=obligation_id)
+        if res.tasks:
+            task = res.tasks[0]
+            task.metadata = {}
+            return task
+
+        # Absolute fallback if no tasks
+        dept = Department.COMPLIANCE
+        unit_head, sub_unit = self._hierarchy.resolve(dept)
+        raci = self._hierarchy.build_raci(dept, unit_head, sub_unit)
+        task = RoutedTask(
+            task_id=_new_id(),
+            obligation_id=obligation_id,
+            department=dept,
+            unit_head=unit_head,
+            sub_unit=sub_unit,
+            directive_text=text,
+            routing_method="FALLBACK",
+            rule_confidence=0.0,
+            ml_confidence=0.0,
+            final_confidence=0.50,
+            status=TaskStatus.PENDING,
+            raci=raci,
+            depends_on=[],
+            dependency_note=None,
+            created_at=_now(),
+        )
+        task.metadata = {}
+        return task
 
     def route_batch(
         self,

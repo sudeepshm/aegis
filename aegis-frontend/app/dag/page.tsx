@@ -1,5 +1,6 @@
 "use client";
 
+import { useState, useEffect } from "react";
 import dynamic from "next/dynamic";
 import { useAegisStore } from "@/lib/store";
 import { GitBranch, Zap, RotateCcw } from "lucide-react";
@@ -18,7 +19,14 @@ const DagCanvas = dynamic(() => import("@/components/dag/DagCanvas"), {
 });
 
 export default function DagPage() {
-  const { blastRadiusActive, blastSourceId, triggerBlastRadius, resetBlastRadius, dagNodes } = useAegisStore();
+  const { blastRadiusActive, blastSourceId, triggerBlastRadius, resetBlastRadius, dagNodes, blastReport } = useAegisStore();
+  const [delayDays, setDelayDays] = useState(15);
+
+  useEffect(() => {
+    if (blastRadiusActive && blastSourceId) {
+      triggerBlastRadius(blastSourceId, delayDays);
+    }
+  }, [delayDays, blastSourceId, blastRadiusActive, triggerBlastRadius]);
 
   const criticalNodes = (dagNodes as Array<{ id: string; data: { riskLevel: string; label: string } }>)
     .filter(n => n.data.riskLevel === "CRITICAL" || n.data.riskLevel === "HIGH");
@@ -89,11 +97,63 @@ export default function DagPage() {
               ))}
             </div>
             {blastRadiusActive && (
-              <div style={{ marginTop: "1rem", padding: "0.75rem", background: "#FEF2F2", border: "1px solid #FECACA", borderRadius: "8px" }}>
-                <div style={{ fontSize: "0.65rem", color: "#EF4444", fontWeight: 700, marginBottom: "0.4rem" }}>CASCADE IMPACT</div>
-                <div style={{ fontSize: "0.72rem", color: "#B91C1C" }}>
-                  Multiple downstream tasks breached.<br />Estimated delay: 14+ days
+              <div style={{ marginTop: "1rem", display: "flex", flexDirection: "column", gap: "0.75rem" }}>
+                {/* Delay Selector */}
+                <div style={{ background: "#F9FAFB", border: "1px solid #E5E7EB", borderRadius: "8px", padding: "0.75rem" }}>
+                  <label style={{ display: "block", fontSize: "0.68rem", fontWeight: 700, color: "#4B5563", marginBottom: "0.4rem" }}>
+                    HYPOTHETICAL DELAY: <span style={{ color: "#EF4444" }}>{delayDays} Days</span>
+                  </label>
+                  <input
+                    type="range" min="1" max="60" value={delayDays}
+                    onChange={e => setDelayDays(parseInt(e.target.value))}
+                    style={{ width: "100%", accentColor: "#EF4444", cursor: "ew-resize" }}
+                  />
+                  <div style={{ display: "flex", justifyContent: "space-between", fontSize: "0.65rem", color: "#9CA3AF", marginTop: "0.25rem" }}>
+                    <span>1d</span>
+                    <span>30d</span>
+                    <span>60d</span>
+                  </div>
                 </div>
+
+                {/* Simulation Report */}
+                {!blastReport ? (
+                  <div style={{ padding: "1.5rem 0.5rem", textAlign: "center", color: "#9CA3AF" }}>
+                    <div style={{ width: "16px", height: "16px", borderRadius: "50%", border: "2px solid #E5E7EB", borderTopColor: "#EF4444", animation: "spin 0.8s linear infinite", margin: "0 auto 0.5rem" }} />
+                    <span style={{ fontSize: "0.68rem" }}>Simulating cascade...</span>
+                  </div>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "0.6rem", background: "#FEF2F2", border: "1px solid #FECACA", borderRadius: "10px", padding: "0.875rem" }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                      <span style={{ fontSize: "0.65rem", color: "#EF4444", fontWeight: 700, letterSpacing: "0.08em" }}>CASCADE IMPACT</span>
+                      <span style={{ background: "#EF4444", color: "#FFFFFF", fontSize: "0.62rem", fontWeight: 700, padding: "0.15rem 0.4rem", borderRadius: "100px" }}>
+                        +{blastReport.risk_delta}% Risk
+                      </span>
+                    </div>
+
+                    <div style={{ fontSize: "0.78rem", fontWeight: 700, color: "#991B1B", lineHeight: 1.3 }}>
+                      {blastReport.affected_tasks ? blastReport.affected_tasks.length : 0} Task(s) Blocked
+                    </div>
+
+                    {blastReport.deadline_breaches && blastReport.deadline_breaches.length > 0 ? (
+                      <div style={{ display: "flex", flexDirection: "column", gap: "0.3rem", marginTop: "0.2rem" }}>
+                        <div style={{ fontSize: "0.6rem", fontWeight: 700, color: "#B91C1C" }}>BREACHED DEADLINES:</div>
+                        {blastReport.deadline_breaches.map((b: any, idx: number) => (
+                          <div key={idx} style={{ fontSize: "0.65rem", color: "#7F1D1D", background: "rgba(239,68,68,0.06)", border: "1px solid rgba(239,68,68,0.15)", borderRadius: "4px", padding: "0.25rem 0.4rem" }}>
+                            ⚠️ <strong>{b.task_name}</strong> - Missed by {b.breach_days}d ({b.penalty_tier} risk)
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div style={{ fontSize: "0.65rem", color: "#047857", background: "#F0FDF4", border: "1px solid #A7F3D0", borderRadius: "4px", padding: "0.3rem", marginTop: "0.2rem" }}>
+                        ✓ Zero regulatory deadlines breached.
+                      </div>
+                    )}
+
+                    <p style={{ fontSize: "0.68rem", color: "#7F1D1D", lineHeight: 1.45, marginTop: "0.2rem", borderTop: "1px solid rgba(239,68,68,0.1)", paddingTop: "0.4rem", fontStyle: "italic" }}>
+                      "{blastReport.narrative}"
+                    </p>
+                  </div>
+                )}
               </div>
             )}
           </div>

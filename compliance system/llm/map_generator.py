@@ -22,8 +22,17 @@ from datetime import datetime, timedelta
 from typing import Any, TypedDict
 
 from langchain_core.messages import HumanMessage, SystemMessage
-from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
+import os
+import time
 from langgraph.graph import END, StateGraph
+
+# Project Aegis — Conflict Detection (Phase 3)
+try:
+    from llm.conflict_detector import stage_conflict_detection
+    _CONFLICT_DETECTION_AVAILABLE = True
+except ImportError:
+    _CONFLICT_DETECTION_AVAILABLE = False
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -95,14 +104,24 @@ class PipelineState(TypedDict, total=False):
     # Meta
     error: str | None
 
+    # Phase 3 — conflict detection results
+    conflict_results: list[dict[str, Any]]
+
 
 # ---------------------------------------------------------------------------
 # LLM Factory
 # ---------------------------------------------------------------------------
 
-def _build_llm(model: str = "gpt-4o", temperature: float = 0.0) -> ChatOpenAI:
-    """Return a ChatOpenAI instance. Override model via environment if needed."""
-    return ChatOpenAI(model=model, temperature=temperature)
+def _build_llm(model: str = "gemini-2.5-flash", temperature: float = 0.0) -> ChatGoogleGenerativeAI:
+    """Return a ChatGoogleGenerativeAI instance. Checks for your key under either name."""
+    api_key = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+    if "gpt" in str(model).lower() or "pro" in str(model).lower():
+        model = "gemini-2.5-flash"
+    return ChatGoogleGenerativeAI(
+        model=model,
+        temperature=temperature,
+        google_api_key=api_key
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -111,11 +130,45 @@ def _build_llm(model: str = "gpt-4o", temperature: float = 0.0) -> ChatOpenAI:
 
 def _parse_json_response(raw: str) -> Any:
     """
-    Robustly parse JSON from an LLM response, stripping markdown fences
-    and leading/trailing whitespace.
+    Robustly parse JSON from an LLM response, stripping markdown fences,
+    handling conversational padding, matching curly/square brackets, and falling back gracefully.
     """
-    cleaned = re.sub(r"```(?:json)?", "", raw).strip().strip("`").strip()
-    return json.loads(cleaned)
+    cleaned = raw.strip()
+    
+    # 1. Try stripping markdown blocks
+    md_match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", cleaned, re.IGNORECASE)
+    if md_match:
+        try:
+            return json.loads(md_match.group(1).strip())
+        except json.JSONDecodeError:
+            pass
+            
+    # 2. Try parsing the whole cleaned text
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        pass
+        
+    # 3. Find the first '{' and the last '}'
+    try:
+        first_curly = cleaned.find("{")
+        last_curly = cleaned.rfind("}")
+        if first_curly != -1 and last_curly != -1 and last_curly > first_curly:
+            return json.loads(cleaned[first_curly:last_curly + 1])
+    except json.JSONDecodeError:
+        pass
+
+    # 4. Find the first '[' and the last ']'
+    try:
+        first_bracket = cleaned.find("[")
+        last_bracket = cleaned.rfind("]")
+        if first_bracket != -1 and last_bracket != -1 and last_bracket > first_bracket:
+            return json.loads(cleaned[first_bracket:last_bracket + 1])
+    except json.JSONDecodeError:
+        pass
+        
+    logger.warning("[JSON-PARSER] Failed to parse any JSON from response: %s", raw[:200])
+    return {}
 
 
 def _risk_from_days(deadline_days: int | None) -> str:
@@ -167,6 +220,7 @@ def stage_obligation_extraction(state: PipelineState) -> PipelineState:
         ob["obligation_id"] = _new_id()
 
     logger.info("Stage 1 | Extracted %d obligation(s)", len(obligations_raw))
+    time.sleep(10)
     return {**state, "obligations_raw": obligations_raw}
 
 
@@ -207,6 +261,7 @@ def stage_action_decomposition(state: PipelineState) -> PipelineState:
                 action["action_id"] = _new_id()
 
     logger.info("Stage 2 | Decomposed %d obligation(s)", len(obligations_decomposed))
+    time.sleep(10)
     return {**state, "obligations_decomposed": obligations_decomposed}
 
 
@@ -255,6 +310,7 @@ def stage_sme_rule_injection(state: PipelineState) -> PipelineState:
         enriched.append({**ob, "actions": actions_enriched})
 
     logger.info("Stage 3 | SME rules applied to %d obligation(s)", len(enriched))
+    time.sleep(10)
     return {**state, "obligations_enriched": enriched}
 
 
@@ -299,6 +355,7 @@ def stage_json_structuring(state: PipelineState) -> PipelineState:
     structured_map.setdefault("validation", {"passed": True, "rejection_reason": None})
 
     logger.info("Stage 4 | Structured map built (map_id=%s)", structured_map["obligation_map_id"])
+    time.sleep(10)
     return {**state, "structured_map": structured_map}
 
 
@@ -349,6 +406,7 @@ def stage_guardrails_validation(state: PipelineState) -> PipelineState:
         structured_map["validation"] = {"passed": True, "rejection_reason": None}
         logger.info("Stage 5 | Validation PASSED")
 
+    time.sleep(10)
     return {**state, "validated_map": structured_map}
 
 
@@ -394,7 +452,15 @@ def _build_graph() -> Any:
     graph.add_edge("action_decomposition",  "sme_rule_injection")
     graph.add_edge("sme_rule_injection",    "json_structuring")
     graph.add_edge("json_structuring",      "guardrails_validation")
-    graph.add_edge("guardrails_validation", END)
+
+    # Phase 3 — conflict detection node (after guardrails_validation)
+    if _CONFLICT_DETECTION_AVAILABLE:
+        graph.add_node("conflict_detector", stage_conflict_detection)
+        graph.add_edge("guardrails_validation", "conflict_detector")
+        graph.add_edge("conflict_detector", END)
+    else:
+        graph.add_edge("guardrails_validation", END)
+
     graph.add_edge("error_handler",         END)
 
     return graph.compile()

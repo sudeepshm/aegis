@@ -51,6 +51,13 @@ from azure.ai.documentintelligence import DocumentIntelligenceClient
 from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
 from azure.core.credentials import AzureKeyCredential
 
+# Project Aegis — Redis-backed deduplication (Phase 1)
+try:
+    from core.redis_client import get_redis, RedisClient
+    _REDIS_AVAILABLE = True
+except ImportError:
+    _REDIS_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
@@ -155,13 +162,23 @@ def _safe_filename(url: str) -> str:
 class HashRegistry:
     """
     Tracks ingested documents by their SHA-256 fingerprint.
-    Uses Azure Table Storage for a cheap, serverless registry in India Central.
+
+    Primary   : Redis (fast O(1) lookup via ``aegis:hash:{namespace}:{sha256}``)
+    Fallback  : Azure Table Storage (durable, serverless, India Central)
+    Dual-write: register() always writes to Azure; Redis is the hot cache.
 
     Partition key : REGULATOR constant ("rbi")
     Row key       : sha256 hex digest
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        redis_client: "RedisClient | None" = None,
+        namespace: str = REGULATOR,
+    ) -> None:
+        self._redis = redis_client
+        self._namespace = namespace
+
         conn_str = _env("AZURE_HASH_TABLE_CONN_STR")
         table_name = _env("AZURE_HASH_TABLE_NAME", "rbiHashRegistry")
 
@@ -175,6 +192,15 @@ class HashRegistry:
         self._client: TableClient = service_client.get_table_client(table_name)
 
     def exists(self, sha256: str) -> bool:
+        # Redis-first path: fast O(1) key check
+        if self._redis is not None:
+            try:
+                if self._redis.hash_exists(sha256, namespace=self._namespace):
+                    return True
+            except Exception:
+                pass  # Redis failure → fall through to Azure
+
+        # Azure Table fallback (source of truth)
         try:
             self._client.get_entity(partition_key=REGULATOR, row_key=sha256)
             return True
@@ -182,6 +208,14 @@ class HashRegistry:
             return False
 
     def register(self, sha256: str, metadata: dict[str, str]) -> None:
+        # Redis path: fast cache write
+        if self._redis is not None:
+            try:
+                self._redis.hash_register(sha256, self._namespace, metadata)
+            except Exception:
+                pass  # Redis failure must never block ingestion
+
+        # Azure Table: ALWAYS write for durability (source of truth)
         entity = {
             "PartitionKey": REGULATOR,
             "RowKey": sha256,
@@ -563,7 +597,10 @@ class RBIIngestionEngine:
     def __init__(self, feed_url: str | None = None) -> None:
         self._feed_url = feed_url or _env("RBI_FEED_URL", DEFAULT_RBI_FEED_URL)
         self._fetcher = FeedFetcher(self._feed_url)
-        self._registry = HashRegistry()
+        self._registry = HashRegistry(
+            redis_client=get_redis() if _REDIS_AVAILABLE else None,
+            namespace=REGULATOR,
+        )
         self._blob_store = BlobStore()
         self._parser = DocumentParser()
         self._dlq = DeadLetterQueue()

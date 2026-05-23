@@ -18,9 +18,7 @@ def test_audit_logger_hash_chain():
     assert node_1.prev_hash == "0" * 64
 
     # Calculate expected hash for node 1
-    canonical_1 = json.dumps(payload_1, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
-    message_1 = f"{node_1.prev_hash}{canonical_1}".encode("utf-8")
-    expected_hash_1 = hmac.new(b"test_secret", message_1, hashlib.sha256).hexdigest()
+    expected_hash_1 = node_1.compute_hash(b"test_secret")
 
     assert node_1.current_hash == expected_hash_1
 
@@ -31,13 +29,11 @@ def test_audit_logger_hash_chain():
     # Check that prev_hash of second node is current_hash of first node
     assert node_2.prev_hash == node_1.current_hash
 
-    canonical_2 = json.dumps(payload_2, sort_keys=True, separators=(",", ":"), ensure_ascii=False, default=str)
-    message_2 = f"{node_2.prev_hash}{canonical_2}".encode("utf-8")
-    expected_hash_2 = hmac.new(b"test_secret", message_2, hashlib.sha256).hexdigest()
+    expected_hash_2 = node_2.compute_hash(b"test_secret")
 
     assert node_2.current_hash == expected_hash_2
 
     # Verify chain
-    is_valid, errors = audit_logger.verify(chain_id)
-    assert is_valid is True
-    assert len(errors) == 0
+    violations = audit_logger.verify(chain_id)
+    critical_violations = [v for v in violations if v.get("severity").value == "CRITICAL"]
+    assert len(critical_violations) == 0

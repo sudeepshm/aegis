@@ -106,6 +106,10 @@ class BlastRadiusReport:
             "narrative":            self.narrative,
             "cascade_tasks":        [c.to_dict() for c in self.cascade_tasks],
             "breached_deadlines":   [b.to_dict() for b in self.breached_deadlines],
+            # Compatibility/Feature mappings for moderate tier M-4:
+            "affected_tasks":       [c.task_name for c in self.cascade_tasks],
+            "deadline_breaches":    [b.to_dict() for b in self.breached_deadlines],
+            "risk_delta":           round(self.risk_delta_pct, 2),
         }
 
 

@@ -85,6 +85,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("validator")
 
+# ── Phase 1: Redis connection singleton ─────────────────────────────────────
+try:
+    from core.redis_client import get_redis
+    _REDIS_AVAILABLE = True
+except ImportError:
+    _REDIS_AVAILABLE = False
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Constants
 # ─────────────────────────────────────────────────────────────────────────────
@@ -203,24 +210,53 @@ class ValidationReport:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# In-memory hash registry (swap for Redis / DB in production)
+# Redis-backed hash registry (replaces local in-memory dict)
 # ─────────────────────────────────────────────────────────────────────────────
 
 class _HashRegistry:
-    """Thread-safe in-process store of seen evidence hashes."""
+    """Redis-backed store of seen evidence hashes with automatic expiration.
+    Falls back to a local in-memory registry if Redis is unreachable or down.
+    """
 
     def __init__(self) -> None:
-        self._store: dict[str, datetime] = {}   # hash → first_seen timestamp
+        self._local_fallback: dict[str, datetime] = {}
 
     def is_duplicate(self, sha256: str) -> bool:
-        return sha256 in self._store
+        if not _REDIS_AVAILABLE or not get_redis()._is_available():
+            return sha256 in self._local_fallback
+        try:
+            return get_redis().hash_exists(sha256, "validation")
+        except Exception as exc:
+            logger.warning("Redis duplicate check failed for hash=%s, using fallback: %s", sha256, exc)
+            return sha256 in self._local_fallback
 
     def register(self, sha256: str, when: datetime) -> None:
-        if sha256 not in self._store:
-            self._store[sha256] = when
+        self._local_fallback[sha256] = when
+        if not _REDIS_AVAILABLE or not get_redis()._is_available():
+            return
+        try:
+            get_redis().hash_register(
+                sha256, 
+                "validation", 
+                {"first_seen": when.isoformat()}
+            )
+        except Exception as exc:
+            logger.warning("Redis register failed for hash=%s: %s", sha256, exc)
 
     def first_seen(self, sha256: str) -> datetime | None:
-        return self._store.get(sha256)
+        if not _REDIS_AVAILABLE or not get_redis()._is_available():
+            return self._local_fallback.get(sha256)
+        try:
+            key = f"aegis:hash:validation:{sha256}"
+            raw = get_redis()._safe_get(key)
+            if raw:
+                meta = json.loads(raw)
+                first_seen_str = meta.get("first_seen")
+                if first_seen_str:
+                    return datetime.fromisoformat(first_seen_str)
+        except Exception as exc:
+            logger.warning("Redis query failed for hash=%s, using fallback: %s", sha256, exc)
+        return self._local_fallback.get(sha256)
 
 
 _HASH_REGISTRY = _HashRegistry()

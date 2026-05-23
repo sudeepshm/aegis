@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import { useAegisStore } from "@/lib/store";
-import { generateWormHash } from "@/lib/utils";
+import { submitCorrection } from "@/lib/api";
 import type { Obligation } from "@/lib/store";
 import { X, AlertTriangle, CheckCircle, Database, Loader2 } from "lucide-react";
 
@@ -19,23 +19,41 @@ export default function CorrectionModal({ obligation, onClose }: { obligation: O
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [success, setSuccess] = useState(false);
   const [wormHash, setWormHash] = useState("");
+  const [errorMsg, setErrorMsg] = useState("");
 
   const handleSubmit = async () => {
     if (!reason.trim()) return;
     setIsSubmitting(true);
-    await new Promise(r => setTimeout(r, 1800));
-    const hash = generateWormHash();
-    setWormHash(hash);
-    applyHITLOverride({
-      obligationId: obligation.id,
-      originalDepartment: obligation.department,
-      newDepartment: newDept,
-      reason,
-      timestamp: new Date().toISOString(),
-      wormHash: hash,
-    });
-    setIsSubmitting(false);
-    setSuccess(true);
+    setErrorMsg("");
+    try {
+      const response = await submitCorrection({
+        chain_id: obligation.id,
+        corrected_by: "cco@aegis.bank",
+        stage: "routing",
+        regulation_ref: obligation.regulation || "unknown_reg",
+        domain: obligation.jurisdiction?.toLowerCase() || "compliance",
+        original_value: obligation.department,
+        corrected_value: newDept,
+        comment: reason,
+      });
+
+      setWormHash(response.correction_id);
+      applyHITLOverride({
+        obligationId: obligation.id,
+        originalDepartment: obligation.department,
+        newDepartment: newDept,
+        reason,
+        timestamp: response.timestamp || new Date().toISOString(),
+        wormHash: response.correction_id,
+        chainId: response.chain_id,
+      });
+      setSuccess(true);
+    } catch (err) {
+      console.error("Failed to submit correction:", err);
+      setErrorMsg(err instanceof Error ? err.message : "Failed to record correction in WORM ledger.");
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -126,6 +144,12 @@ export default function CorrectionModal({ obligation, onClose }: { obligation: O
                 }}
               />
               {!reason && <div style={{ fontSize: "0.72rem", color: "#EF4444", marginTop: "0.35rem" }}>Reason is required to proceed</div>}
+              {errorMsg && (
+                <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", fontSize: "0.75rem", color: "#EF4444", marginTop: "0.5rem", background: "#FEF2F2", border: "1px solid #FECACA", padding: "0.5rem", borderRadius: "6px" }}>
+                  <AlertTriangle size={12} />
+                  <span>{errorMsg}</span>
+                </div>
+              )}
             </div>
 
             {/* Actions */}

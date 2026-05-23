@@ -65,10 +65,21 @@ const nodeTypes = { dagNode: DagTaskNode };
 
 // ── DAG Canvas ────────────────────────────────────────────────────────────────
 export default function DagCanvas() {
-  const { dagNodes: rawNodes, dagEdges: rawEdges, blastRadiusActive, blastSourceId } = useAegisStore();
+  const { dagNodes: rawNodes, dagEdges: rawEdges, blastRadiusActive, blastSourceId, blastReport } = useAegisStore();
 
   const downstreamIds = useMemo(() => {
     if (!blastRadiusActive || !blastSourceId) return new Set<string>();
+
+    // If report has loaded from the python simulator, use the exact affected_tasks list!
+    if (blastReport && blastReport.affected_tasks) {
+      const ids = new Set<string>([blastSourceId]);
+      blastReport.affected_tasks.forEach((taskName: string) => {
+        ids.add(taskName);
+      });
+      return ids;
+    }
+
+    // High-speed local BFS fallback while the API request is in-flight
     const edges = rawEdges as Array<{ source: string; target: string }>;
     const visited = new Set<string>([blastSourceId]);
     const queue = [blastSourceId];
@@ -79,7 +90,7 @@ export default function DagCanvas() {
       });
     }
     return visited;
-  }, [blastRadiusActive, blastSourceId, rawEdges]);
+  }, [blastRadiusActive, blastSourceId, rawEdges, blastReport]);
 
   const annotatedNodes = useMemo(() =>
     (rawNodes as Array<{ id: string; type: string; position: { x: number; y: number }; data: Record<string, unknown> }>).map(n => ({

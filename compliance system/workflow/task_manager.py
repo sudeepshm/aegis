@@ -49,6 +49,9 @@ from pathlib import Path
 import os
 import asyncio
 import traceback
+import httpx
+import smtplib
+from email.mime.text import MIMEText
 try:
     from azure.cosmos.aio import CosmosClient as AsyncCosmosClient
     from azure.cosmos.exceptions import CosmosResourceExistsError
@@ -63,6 +66,13 @@ except Exception:
     CosmosHttpResponseError = Exception
     _COSMOS_AIO_AVAILABLE = False
 from typing import Any, Callable, Coroutine
+
+# Project Aegis — Redis SLA state cache (Phase 1)
+try:
+    from core.redis_client import get_redis
+    _REDIS_AVAILABLE = True
+except ImportError:
+    _REDIS_AVAILABLE = False
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -497,20 +507,24 @@ class AlertStore:
 class ServiceNowClient:
     """
     Minimal ServiceNow REST API wrapper.
-    Mocked with realistic response shapes; replace with real HTTP calls.
+    Connects to the ServiceNow Incident Table API.
+    Fails safe to simulated IDs to ensure zero LangGraph pipeline crashes.
     """
 
     def __init__(
         self,
-        instance_url: str = "https://company.service-now.com",
-        username:     str = "svc_compliance",
-        password:     str = "CHANGEME",
+        instance_url: str | None = None,
+        username:     str | None = None,
+        password:     str | None = None,
     ) -> None:
-        self._base = instance_url
-        self._auth = (username, password)
+        self._base = instance_url or os.environ.get("SERVICENOW_INSTANCE_URL", "https://company.service-now.com")
+        self._username = username or os.environ.get("SERVICENOW_USERNAME", "svc_compliance")
+        self._password = password or os.environ.get("SERVICENOW_PASSWORD", "CHANGEME")
+        self._client_id = os.environ.get("SERVICENOW_CLIENT_ID", "")
+        self._client_secret = os.environ.get("SERVICENOW_CLIENT_SECRET", "")
 
     async def open_ticket(self, ticket: TicketRecord) -> str:
-        """Create an Incident / Change Request in ServiceNow. Returns sys_id."""
+        """Create an Incident / Change Request in ServiceNow. Returns sys_id or local fallback."""
         payload = {
             "short_description": ticket.title,
             "description":       ticket.description,
@@ -522,10 +536,31 @@ class ServiceNowClient:
             "u_task_id":         ticket.task_id,
             "u_sla_deadline":    ticket.sla.deadline,
         }
-        # ── MOCK response ────────────────────────────────────────────────────
-        snow_id = f"INC{uuid.uuid4().hex[:7].upper()}"
-        logger.info("[SNOW] Opened ticket %s for task %s", snow_id, ticket.task_id)
-        return snow_id
+        fallback_id = f"INC{uuid.uuid4().hex[:7].upper()}"
+        
+        try:
+            headers = {"Accept": "application/json", "Content-Type": "application/json"}
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                # Basic Authentication is standard for Table API
+                resp = await client.post(
+                    f"{self._base.rstrip('/')}/api/now/table/incident",
+                    json=payload,
+                    auth=(self._username, self._password),
+                    headers=headers
+                )
+                if resp.status_code in (200, 201):
+                    result = resp.json().get("result", {})
+                    # sys_id is the primary key in ServiceNow
+                    sys_id = result.get("sys_id")
+                    if sys_id:
+                        logger.info("[SNOW] Opened ticket %s (sys_id=%s) for task %s", result.get("number", sys_id), sys_id, ticket.task_id)
+                        return sys_id
+                
+                logger.warning("[SNOW] Failed to open ticket. Code: %d, Response: %s", resp.status_code, resp.text)
+        except Exception as exc:
+            logger.warning("[SNOW] Connection to ServiceNow timed out or failed. Falling back to local ID: %s. Exception: %s", fallback_id, exc)
+            
+        return fallback_id
 
     async def update_ticket(
         self,
@@ -534,7 +569,25 @@ class ServiceNowClient:
         comment: str = "",
     ) -> None:
         """Update work notes and state on an existing ServiceNow ticket."""
-        logger.info("[SNOW] Updated %s → state=%s", snow_id, state)
+        try:
+            payload = {"work_notes": comment}
+            if state:
+                payload["state"] = state
+                
+            headers = {"Accept": "application/json", "Content-Type": "application/json"}
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.patch(
+                    f"{self._base.rstrip('/')}/api/now/table/incident/{snow_id}",
+                    json=payload,
+                    auth=(self._username, self._password),
+                    headers=headers
+                )
+                if resp.status_code in (200, 204):
+                    logger.info("[SNOW] Updated %s → state=%s", snow_id, state)
+                else:
+                    logger.warning("[SNOW] Failed to update ticket %s. Code: %d", snow_id, resp.status_code)
+        except Exception as exc:
+            logger.warning("[SNOW] Exception updating ticket %s: %s", snow_id, exc)
 
     async def link_dependency(
         self,
@@ -542,14 +595,46 @@ class ServiceNowClient:
         child_snow_id:  str,
         relationship:   str = "Depends on::Depended on by",
     ) -> None:
-        """Create a dependency relationship between two SNOW tickets."""
-        logger.info(
-            "[SNOW] Linked %s → %s (%s)", parent_snow_id, child_snow_id, relationship
-        )
+        """Create a dependency relationship between two SNOW tickets by setting parent_incident."""
+        try:
+            payload = {"parent_incident": parent_snow_id, "work_notes": f"Linked dependency: {relationship}"}
+            headers = {"Accept": "application/json", "Content-Type": "application/json"}
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.patch(
+                    f"{self._base.rstrip('/')}/api/now/table/incident/{child_snow_id}",
+                    json=payload,
+                    auth=(self._username, self._password),
+                    headers=headers
+                )
+                if resp.status_code in (200, 204):
+                    logger.info("[SNOW] Linked %s → %s (%s)", parent_snow_id, child_snow_id, relationship)
+                else:
+                    logger.warning("[SNOW] Failed to link dependency %s → %s. Code: %d", parent_snow_id, child_snow_id, resp.status_code)
+        except Exception as exc:
+            logger.warning("[SNOW] Exception linking dependency %s → %s: %s", parent_snow_id, child_snow_id, exc)
 
     async def get_ticket_state(self, snow_id: str) -> dict:
         """Fetch current state of a ServiceNow ticket."""
-        return {"sys_id": snow_id, "state": "In Progress", "updated_on": _now_str()}
+        fallback = {"sys_id": snow_id, "state": "In Progress", "updated_on": _now_str()}
+        try:
+            headers = {"Accept": "application/json"}
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(
+                    f"{self._base.rstrip('/')}/api/now/table/incident/{snow_id}",
+                    auth=(self._username, self._password),
+                    headers=headers
+                )
+                if resp.status_code == 200:
+                    result = resp.json().get("result", {})
+                    state_val = result.get("incident_state") or result.get("state", "In Progress")
+                    updated_on = result.get("sys_updated_on") or _now_str()
+                    return {"sys_id": snow_id, "state": state_val, "updated_on": updated_on}
+                else:
+                    logger.warning("[SNOW] Failed to fetch state for ticket %s. Code: %d", snow_id, resp.status_code)
+        except Exception as exc:
+            logger.warning("[SNOW] Exception fetching state for ticket %s: %s", snow_id, exc)
+            
+        return fallback
 
     @staticmethod
     def _risk_to_priority(risk: str) -> str:
@@ -575,12 +660,25 @@ class TeamsNotifier:
         level:             EscalationLevel,
     ) -> bool:
         card = self._build_card(subject, body_lines, ticket, level)
-        # ── MOCK send ─────────────────────────────────────────────────────────
-        logger.info(
-            "[TEAMS] %s → '%s' | ticket=%s | level=%s",
-            recipient_webhook[:40], subject, ticket.ticket_id, level.value,
-        )
-        return True
+        webhook_url = recipient_webhook or os.environ.get("TEAMS_WEBHOOK_URL") or self._default_webhook
+        
+        if not webhook_url or "PLACEHOLDER" in webhook_url:
+            logger.info("[TEAMS] Webhook URL is placeholder/empty. Skipping real HTTP request. Ticket=%s", ticket.ticket_id)
+            return True
+            
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                headers = {"Content-Type": "application/json"}
+                resp = await client.post(webhook_url, json=card, headers=headers)
+                if resp.status_code in (200, 201, 202, 204):
+                    logger.info("[TEAMS] Alert sent successfully for ticket %s", ticket.ticket_id)
+                    return True
+                else:
+                    logger.warning("[TEAMS] Failed to post to webhook. Code: %d, Response: %s", resp.status_code, resp.text)
+        except Exception as exc:
+            logger.error("[TEAMS] Failed to send webhook alert for ticket %s: %s", ticket.ticket_id, exc)
+            
+        return False
 
     def _build_card(
         self,
@@ -622,7 +720,7 @@ class TeamsNotifier:
 
 
 class EmailNotifier:
-    """Sends compliance alert emails (mock — swap for SendGrid / SES / SMTP)."""
+    """Sends compliance alert emails using secure SMTP transmission."""
 
     async def send(
         self,
@@ -633,11 +731,44 @@ class EmailNotifier:
         level:      EscalationLevel,
     ) -> bool:
         body = "\n".join(body_lines)
-        logger.info(
-            "[EMAIL] To=%s | Subject='%s' | ticket=%s | level=%s",
-            to_email, subject, ticket.ticket_id, level.value,
-        )
-        return True
+        
+        smtp_host = os.environ.get("SMTP_HOST", "")
+        smtp_port_str = os.environ.get("SMTP_PORT", "587")
+        sender = os.environ.get("ALERT_SENDER", "compliance@bank.org")
+        username = os.environ.get("SMTP_USERNAME") or os.environ.get("ALERT_SENDER", "")
+        password = os.environ.get("SMTP_PASSWORD", "")
+        
+        if not smtp_host:
+            logger.info("[EMAIL] SMTP_HOST not configured. Skipping real mail. To=%s, Subject=%s", to_email, subject)
+            return True
+            
+        try:
+            smtp_port = int(smtp_port_str)
+        except ValueError:
+            smtp_port = 587
+            
+        try:
+            # Build standard MIME email
+            msg = MIMEText(body)
+            msg["Subject"] = subject
+            msg["From"] = sender
+            msg["To"] = to_email
+            
+            # Connect synchronously in threadpool to avoid blocking async loop
+            def _send_sync():
+                with smtplib.SMTP(smtp_host, smtp_port, timeout=10.0) as server:
+                    server.starttls()
+                    if password:
+                        server.login(username, password)
+                    server.send_message(msg)
+            
+            await asyncio.get_event_loop().run_in_executor(None, _send_sync)
+            logger.info("[EMAIL] Secure email sent successfully to %s", to_email)
+            return True
+        except Exception as exc:
+            logger.error("[EMAIL] Failed to send secure SMTP alert to %s: %s", to_email, exc)
+            
+        return False
 
 
 class SMSNotifier:
@@ -918,12 +1049,64 @@ class SLATimer:
                 await self._escalation.evaluate(ticket)
                 self._store.save(ticket)   # persist updated sla fields
 
+                # Project Aegis — cache SLA state in Redis (Phase 1)
+                if _REDIS_AVAILABLE:
+                    try:
+                        get_redis().sla_set(ticket.ticket_id, ticket.sla.to_dict())
+                    except Exception:
+                        pass   # Redis failure must never break the SLA loop
+
             await asyncio.sleep(self._poll_sec)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Task Manager  (public facade)
 # ─────────────────────────────────────────────────────────────────────────────
+
+def load_escalation_contacts(department: str) -> dict[str, Contact]:
+    """
+    Dynamically loads contacts for unit_head, compliance_officer, and cco.
+    Reads from DEMO_CONTACTS_JSON env var or falls back to standard test emails.
+    """
+    defaults = {
+        "unit_head": {
+            "name": f"Head of {department}",
+            "email": f"unit.head.{department.lower().replace(' ', '')}@bank.org",
+            "teams": "https://outlook.office.com/webhook/PLACEHOLDER"
+        },
+        "compliance_officer": {
+            "name": "Compliance Officer",
+            "email": "compliance@bank.org",
+            "teams": "https://outlook.office.com/webhook/PLACEHOLDER"
+        },
+        "cco": {
+            "name": "Chief Compliance Officer",
+            "email": "cco@bank.org",
+            "teams": "https://outlook.office.com/webhook/PLACEHOLDER"
+        }
+    }
+
+    contacts_json = os.environ.get("DEMO_CONTACTS_JSON", "")
+    if contacts_json:
+        try:
+            data = json.loads(contacts_json)
+            uh_data = data.get("unit_heads", {}).get(department, defaults["unit_head"])
+            co_data = data.get("compliance_officer", defaults["compliance_officer"])
+            cco_data = data.get("cco", defaults["cco"])
+            return {
+                "unit_head": Contact(uh_data.get("name", defaults["unit_head"]["name"]), uh_data.get("email", defaults["unit_head"]["email"]), uh_data.get("teams", defaults["unit_head"]["teams"])),
+                "compliance_officer": Contact(co_data.get("name", defaults["compliance_officer"]["name"]), co_data.get("email", defaults["compliance_officer"]["email"]), co_data.get("teams", defaults["compliance_officer"]["teams"])),
+                "cco": Contact(cco_data.get("name", defaults["cco"]["name"]), cco_data.get("email", defaults["cco"]["email"]), cco_data.get("teams", defaults["cco"]["teams"]))
+            }
+        except Exception as exc:
+            logger.warning("Failed to parse DEMO_CONTACTS_JSON: %s. Using default emails.", exc)
+
+    return {
+        "unit_head": Contact(defaults["unit_head"]["name"], defaults["unit_head"]["email"], defaults["unit_head"]["teams"]),
+        "compliance_officer": Contact(defaults["compliance_officer"]["name"], defaults["compliance_officer"]["email"], defaults["compliance_officer"]["teams"]),
+        "cco": Contact(defaults["cco"]["name"], defaults["cco"]["email"], defaults["cco"]["teams"])
+    }
+
 
 class TaskManager:
     """
@@ -1040,6 +1223,12 @@ class TaskManager:
         )
 
         self._store.save(ticket)
+        # Project Aegis — pre-populate Redis SLA cache (Phase 1)
+        if _REDIS_AVAILABLE:
+            try:
+                get_redis().sla_set(ticket.ticket_id, ticket.sla.to_dict())
+            except Exception:
+                pass   # Redis failure must never block ticket creation
         # Persist to Cosmos asynchronously if available
         if self._cosmos_store:
             try:
@@ -1066,10 +1255,11 @@ class TaskManager:
 
         Returns the persisted TicketRecord with `snow_ticket_id` populated.
         """
-        # Build placeholder contacts
-        unit_head = Contact("Unit Head", f"unit.head@{department.lower().replace(' ', '')}.bank.org", "https://teams.webhook/unit")
-        compliance_officer = Contact("Compliance Officer", "compliance@bank.org", "https://teams.webhook/cco")
-        cco = Contact("Chief Compliance Officer", "cco@bank.org", "https://teams.webhook/cco")
+        # Build dynamic escalation contacts
+        contacts = load_escalation_contacts(department)
+        unit_head = contacts["unit_head"]
+        compliance_officer = contacts["compliance_officer"]
+        cco = contacts["cco"]
 
         ticket = self.create_ticket(
             obligation_id=obligation_id,

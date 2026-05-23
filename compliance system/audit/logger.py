@@ -79,6 +79,7 @@ class NodeType(str, Enum):
     TASK       = "Task"
     EVIDENCE   = "Evidence"
     SIGNOFF    = "Sign-off"
+    HUMAN_CORRECTION = "Human-Correction"
 
 
 class AlertSeverity(str, Enum):
@@ -133,6 +134,14 @@ class TraceabilityNode:
     is_override: bool = False                # True if a human manually overrode an automated decision
     override_actor: Optional[str] = None     # identity of the override actor
     chain_id:    str = ""                    # groups all nodes for one compliance run
+
+    @property
+    def current_hash(self) -> str:
+        return self.node_hash
+
+    @current_hash.setter
+    def current_hash(self, val: str) -> None:
+        self.node_hash = val
 
     def compute_hash(self, hmac_secret: bytes) -> str:
         """
@@ -806,6 +815,118 @@ class AuditLogger:
         if violations:
             self._alerter.dispatch(violations, chain_id)
         return violations
+
+    # ------------------------------------------------------------------
+    def get_chain(self, chain_id: str) -> Optional[AuditChain]:
+        """Retrieve the list of nodes for a chain wrapped in an AuditChain object."""
+        if chain_id in self._chains:
+            return AuditChain(self._chains[chain_id])
+        return None
+
+    # ------------------------------------------------------------------
+    async def log_human_correction(
+        self,
+        chain_id: str,
+        corrected_by: str,
+        stage: str,
+        original_value: Any,
+        corrected_value: Any,
+        regulation_ref: str,
+        domain: str,
+        comment: str = "",
+    ) -> str:
+        """
+        Log a manual correction from the Chief Compliance Officer.
+        Appends a HUMAN_CORRECTION node to the active chain and registers
+        the correction in the in-memory ledger for few-shot search.
+        """
+        correction_id = str(uuid.uuid4())
+        payload = {
+            "correction_id": correction_id,
+            "chain_id": chain_id,
+            "corrected_by": corrected_by,
+            "stage": stage,
+            "original_value": original_value,
+            "corrected_value": corrected_value,
+            "regulation_ref": regulation_ref,
+            "domain": domain,
+            "comment": comment,
+            "timestamp": _utcnow(),
+        }
+
+        # dual-write to in-memory ledger for fast querying
+        _IN_MEMORY_CORRECTIONS.append(payload)
+
+        # append to traceability chain
+        self.append(
+            chain_id=chain_id,
+            node_type=NodeType.HUMAN_CORRECTION,
+            payload=payload,
+            is_override=True,
+            override_actor=corrected_by,
+        )
+        return correction_id
+
+
+class AuditChain:
+    """Wraps a list of TraceabilityNodes to match test suite properties."""
+    def __init__(self, nodes: list[TraceabilityNode]):
+        self.nodes = nodes
+
+
+_IN_MEMORY_CORRECTIONS: list[dict] = []
+
+
+class CorrectionLedgerClient:
+    """
+    Client for querying human compliance corrections from the WORM ledger.
+    Provides automatic in-memory fallbacks when Cosmos DB is unconfigured.
+    """
+
+    def __init__(self, worm_writer: Optional[CosmosWORMWriter] = None):
+        self._worm = worm_writer
+
+    async def get_recent_corrections(
+        self,
+        domain: str,
+        regulation_ref: str = "",
+        limit: int = 5,
+    ) -> list[dict]:
+        all_corrections = []
+        if self._worm:
+            try:
+                query = "SELECT * FROM c WHERE c.node_type = @node_type"
+                params = [{"name": "@node_type", "value": NodeType.HUMAN_CORRECTION.value}]
+                docs = list(self._worm._ledger.query_items(
+                    query=query, parameters=params, enable_cross_partition_query=True
+                ))
+                all_corrections = [d["payload"] for d in docs if "payload" in d]
+            except Exception as exc:
+                logger.error("Cosmos DB corrections query failed: %s", exc)
+                all_corrections = _IN_MEMORY_CORRECTIONS
+        else:
+            all_corrections = _IN_MEMORY_CORRECTIONS
+
+        # Apply fallback logic
+        # 1. Exact match by domain and regulation_ref
+        exact_matches = []
+        if regulation_ref:
+            exact_matches = [
+                c for c in all_corrections
+                if c.get("domain") == domain and c.get("regulation_ref") == regulation_ref
+            ]
+
+        if exact_matches:
+            exact_matches.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+            return exact_matches[:limit]
+
+        # 2. Domain fallback (regardless of regulation_ref)
+        fallback_matches = [
+            c for c in all_corrections
+            if c.get("domain") == domain
+        ]
+        fallback_matches.sort(key=lambda x: x.get("timestamp", ""), reverse=True)
+        return fallback_matches[:limit]
 
 
 # ===========================================================================
