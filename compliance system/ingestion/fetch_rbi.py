@@ -1,638 +1,755 @@
 """
 ingestion/fetch_rbi.py
-======================
-Production-grade regulatory document ingestion engine.
+----------------------
+RBI Notifications Ingestion Engine — Azure (India Central)
 
-Supports multiple regulatory sources:
-  - RBI  (Reserve Bank of India)
-  - SEBI (Securities and Exchange Board of India)
-  - CERT-In (Indian Computer Emergency Response Team)
-  - DPDP (Digital Personal Data Protection Act)
+Pipeline:
+  1. Fetch RBI RSS/Atom feed → deduplicate via SHA-256 registry
+  2. Download PDFs → upload to Azure Blob Storage
+       /regulatory-store/rbi/{year}/{month}/{document_id}.pdf
+  3. Parse PDFs with Azure Document Intelligence (Tesseract OCR fallback)
+  4. Normalize to standard JSON schema
+  5. DLQ (Azure Service Bus) for failed documents
 
-Pipeline
---------
-  1. Fetch     → Download document from source URL or ADLS blob
-  2. Deduplicate → SHA-256 hash-based deduplication against Cosmos DB
-  3. Parse     → Extract text via Azure Document Intelligence (Form Recognizer)
-  4. OCR Fallback → If text extraction yields low confidence, run OCR pipeline
-  5. Store     → Upload parsed content to ADLS Gen2 and register in Cosmos DB
-
-Dependencies
-------------
-  pip install azure-storage-blob azure-cosmos azure-ai-formrecognizer httpx
+Environment variables (set via Azure Key Vault / App Configuration):
+  AZURE_STORAGE_CONN_STR          – Blob Storage connection string
+  AZURE_DOC_INTEL_ENDPOINT        – Document Intelligence endpoint (India Central)
+  AZURE_DOC_INTEL_KEY             – Document Intelligence API key
+  AZURE_SERVICEBUS_CONN_STR       – Service Bus namespace connection string
+  AZURE_SERVICEBUS_DLQ_QUEUE      – DLQ queue name (e.g. "rbi-ingestion-dlq")
+  AZURE_HASH_TABLE_CONN_STR       – Azure Table Storage connection string
+  AZURE_HASH_TABLE_NAME           – Table name for SHA-256 deduplication registry
+  RBI_FEED_URL                    – RBI notifications RSS/Atom feed URL
+                                    (default: https://www.rbi.org.in/Scripts/RSS.aspx)
 """
 
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import logging
+import os
+import re
+import tempfile
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from pathlib import Path
-from typing import Any, Optional
+from typing import Any
+from urllib.parse import urlparse
 
-import httpx
+import feedparser
+import requests
+from azure.core.exceptions import AzureError, ResourceExistsError
+from azure.data.tables import TableClient, TableServiceClient
+from azure.servicebus import ServiceBusClient, ServiceBusMessage
+from azure.storage.blob import BlobServiceClient, ContentSettings
+
+# Azure Document Intelligence (Form Recognizer v4 SDK)
+from azure.ai.documentintelligence import DocumentIntelligenceClient
+from azure.ai.documentintelligence.models import AnalyzeDocumentRequest
+from azure.core.credentials import AzureKeyCredential
 
 logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+)
 
-# ──────────────────────────────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
 # Constants
-# ──────────────────────────────────────────────────────────────────────────────
-OCR_CONFIDENCE_THRESHOLD = 0.70   # below this, trigger OCR fallback
-DEDUP_LOOKBACK_DAYS      = 365
-MAX_DOCUMENT_SIZE_MB     = 50
-SUPPORTED_MIME_TYPES     = {
-    "application/pdf",
-    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-    "text/html",
-    "text/plain",
-}
+# ---------------------------------------------------------------------------
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Enumerations
-# ──────────────────────────────────────────────────────────────────────────────
+REGULATOR = "rbi"
+BLOB_CONTAINER = "regulatory-store"
+AZURE_REGION = "indiacentral"
 
-class RegulatorySource(str, Enum):
-    RBI     = "RBI"
-    SEBI    = "SEBI"
-    CERT_IN = "CERT_IN"
-    DPDP    = "DPDP"
+DEFAULT_RBI_FEED_URL = "https://www.rbi.org.in/Scripts/RSS.aspx"
 
+# HTTP timeouts (seconds)
+FEED_TIMEOUT = 30
+PDF_DOWNLOAD_TIMEOUT = 60
+PDF_CHUNK_SIZE = 1024 * 256  # 256 KB
 
-class IngestionStatus(str, Enum):
-    PENDING    = "PENDING"
-    FETCHED    = "FETCHED"
-    DUPLICATE  = "DUPLICATE"
-    PARSED     = "PARSED"
-    OCR_NEEDED = "OCR_NEEDED"
-    COMPLETED  = "COMPLETED"
-    FAILED     = "FAILED"
+# Document Intelligence model — prebuilt layout captures text + tables + headings
+DOC_INTEL_MODEL = "prebuilt-layout"
 
+# ---------------------------------------------------------------------------
+# Data models
+# ---------------------------------------------------------------------------
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Data Structures
-# ──────────────────────────────────────────────────────────────────────────────
 
 @dataclass
-class IngestionResult:
-    """Result of ingesting a single regulatory document."""
-    doc_id:          str
-    source:          RegulatorySource
-    source_url:      str
-    status:          IngestionStatus
-    content_hash:    str           = ""
-    extracted_text:  str           = ""
-    confidence:      float         = 0.0
-    ocr_used:        bool          = False
-    blob_path:       str           = ""
-    metadata:        dict[str, Any] = field(default_factory=dict)
-    errors:          list[str]     = field(default_factory=list)
-    timestamp:       str           = field(
-        default_factory=lambda: datetime.now(tz=timezone.utc).isoformat()
+class RawFeedEntry:
+    """A single entry parsed from the RBI RSS/Atom feed."""
+
+    entry_id: str          # feed-provided GUID or link
+    title: str
+    link: str              # URL to the notification / PDF
+    published: datetime
+    summary: str = ""
+    sha256: str = field(init=False)
+
+    def __post_init__(self) -> None:
+        # Deterministic hash: SHA-256 over (link + title) — stable across re-fetches
+        payload = f"{self.link}|{self.title}".encode("utf-8")
+        self.sha256 = hashlib.sha256(payload).hexdigest()
+
+
+@dataclass
+class ExtractedContent:
+    raw_text: str
+    tables: list[dict[str, Any]]
+    section_headings: list[str]
+    page_count: int
+    extraction_method: str   # "document_intelligence" | "tesseract"
+
+
+@dataclass
+class NormalizedDocument:
+    document_id: str
+    regulator: str
+    source_url: str
+    blob_path: str
+    published_date: str      # ISO-8601
+    title: str
+    sha256: str
+    extracted_content: dict[str, Any]
+    ingested_at: str         # ISO-8601
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _env(key: str, default: str | None = None) -> str:
+    value = os.environ.get(key, default)
+    if value is None:
+        raise EnvironmentError(
+            f"Required environment variable '{key}' is not set. "
+            "Ensure it is injected from Azure Key Vault or App Configuration."
+        )
+    return value
+
+
+def _utcnow_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _safe_filename(url: str) -> str:
+    """Derive a clean filename from a URL."""
+    parsed = urlparse(url)
+    name = os.path.basename(parsed.path) or "document"
+    # Strip non-alphanumeric except hyphens/underscores/dots
+    name = re.sub(r"[^\w.\-]", "_", name)
+    return name if name.endswith(".pdf") else f"{name}.pdf"
+
+
+# ---------------------------------------------------------------------------
+# SHA-256 Deduplication Registry (Azure Table Storage)
+# ---------------------------------------------------------------------------
+
+
+class HashRegistry:
+    """
+    Tracks ingested documents by their SHA-256 fingerprint.
+    Uses Azure Table Storage for a cheap, serverless registry in India Central.
+
+    Partition key : REGULATOR constant ("rbi")
+    Row key       : sha256 hex digest
+    """
+
+    def __init__(self) -> None:
+        conn_str = _env("AZURE_HASH_TABLE_CONN_STR")
+        table_name = _env("AZURE_HASH_TABLE_NAME", "rbiHashRegistry")
+
+        service_client = TableServiceClient.from_connection_string(conn_str)
+        try:
+            service_client.create_table(table_name)
+            logger.info("Created hash registry table '%s'.", table_name)
+        except ResourceExistsError:
+            pass  # Table already exists — expected in steady state
+
+        self._client: TableClient = service_client.get_table_client(table_name)
+
+    def exists(self, sha256: str) -> bool:
+        try:
+            self._client.get_entity(partition_key=REGULATOR, row_key=sha256)
+            return True
+        except Exception:
+            return False
+
+    def register(self, sha256: str, metadata: dict[str, str]) -> None:
+        entity = {
+            "PartitionKey": REGULATOR,
+            "RowKey": sha256,
+            "registered_at": _utcnow_iso(),
+            **{k: str(v) for k, v in metadata.items()},
+        }
+        self._client.upsert_entity(entity)
+
+
+# ---------------------------------------------------------------------------
+# Blob Storage
+# ---------------------------------------------------------------------------
+
+
+class BlobStore:
+    """
+    Manages raw PDF uploads to Azure Blob Storage.
+    Container : regulatory-store
+    Path      : /regulatory-store/rbi/{year}/{month}/{document_id}.pdf
+    """
+
+    def __init__(self) -> None:
+        conn_str = _env("AZURE_STORAGE_CONN_STR")
+        self._service = BlobServiceClient.from_connection_string(conn_str)
+        self._container = self._service.get_container_client(BLOB_CONTAINER)
+        try:
+            self._container.create_container()
+            logger.info("Created blob container '%s'.", BLOB_CONTAINER)
+        except ResourceExistsError:
+            pass
+
+    def upload_pdf(
+        self,
+        pdf_bytes: bytes,
+        document_id: str,
+        published_date: datetime,
+    ) -> str:
+        """Upload PDF and return its blob path."""
+        year = published_date.strftime("%Y")
+        month = published_date.strftime("%m")
+        blob_path = f"{REGULATOR}/{year}/{month}/{document_id}.pdf"
+
+        blob_client = self._container.get_blob_client(blob_path)
+        blob_client.upload_blob(
+            data=pdf_bytes,
+            overwrite=True,
+            content_settings=ContentSettings(content_type="application/pdf"),
+            metadata={
+                "document_id": document_id,
+                "regulator": REGULATOR,
+                "region": AZURE_REGION,
+            },
+        )
+        logger.info("Uploaded PDF to blob path: %s", blob_path)
+        return blob_path
+
+    def get_pdf_bytes(self, blob_path: str) -> bytes:
+        blob_client = self._container.get_blob_client(blob_path)
+        downloader = blob_client.download_blob()
+        return downloader.readall()
+
+
+# ---------------------------------------------------------------------------
+# PDF Parsing — Azure Document Intelligence + Tesseract fallback
+# ---------------------------------------------------------------------------
+
+
+class DocumentParser:
+    """
+    Primary  : Azure Document Intelligence (prebuilt-layout model)
+    Fallback : Tesseract OCR via pytesseract + pdf2image
+    """
+
+    def __init__(self) -> None:
+        endpoint = _env("AZURE_DOC_INTEL_ENDPOINT")
+        key = _env("AZURE_DOC_INTEL_KEY")
+        self._doc_intel = DocumentIntelligenceClient(
+            endpoint=endpoint,
+            credential=AzureKeyCredential(key),
+        )
+
+    # ------------------------------------------------------------------
+    # Public entry point
+    # ------------------------------------------------------------------
+
+    def parse(self, pdf_bytes: bytes) -> ExtractedContent:
+        try:
+            return self._parse_with_doc_intel(pdf_bytes)
+        except Exception as exc:
+            logger.warning(
+                "Document Intelligence failed (%s). Falling back to Tesseract OCR.", exc
+            )
+            return self._parse_with_tesseract(pdf_bytes)
+
+    # ------------------------------------------------------------------
+    # Azure Document Intelligence
+    # ------------------------------------------------------------------
+
+    def _parse_with_doc_intel(self, pdf_bytes: bytes) -> ExtractedContent:
+        poller = self._doc_intel.begin_analyze_document(
+            model_id=DOC_INTEL_MODEL,
+            analyze_request=AnalyzeDocumentRequest(bytes_source=pdf_bytes),
+        )
+        result = poller.result()
+
+        raw_text_parts: list[str] = []
+        tables: list[dict[str, Any]] = []
+        section_headings: list[str] = []
+        page_count = len(result.pages) if result.pages else 0
+
+        # ---- Text & headings ----
+        for page in result.pages or []:
+            for line in page.lines or []:
+                raw_text_parts.append(line.content)
+
+        # Paragraphs carry role metadata (e.g., "title", "sectionHeading")
+        for para in result.paragraphs or []:
+            role = (para.role or "").lower()
+            if role in ("title", "sectionheading", "heading"):
+                section_headings.append(para.content)
+
+        # ---- Tables ----
+        for tbl_idx, table in enumerate(result.tables or []):
+            rows_dict: dict[int, dict[int, str]] = {}
+            for cell in table.cells or []:
+                rows_dict.setdefault(cell.row_index, {})[cell.column_index] = (
+                    cell.content
+                )
+            serialized_rows = [
+                [rows_dict[r].get(c, "") for c in range(table.column_count)]
+                for r in range(table.row_count)
+            ]
+            tables.append(
+                {
+                    "table_index": tbl_idx,
+                    "row_count": table.row_count,
+                    "column_count": table.column_count,
+                    "rows": serialized_rows,
+                }
+            )
+
+        return ExtractedContent(
+            raw_text="\n".join(raw_text_parts),
+            tables=tables,
+            section_headings=section_headings,
+            page_count=page_count,
+            extraction_method="document_intelligence",
+        )
+
+    # ------------------------------------------------------------------
+    # Tesseract OCR fallback
+    # ------------------------------------------------------------------
+
+    def _parse_with_tesseract(self, pdf_bytes: bytes) -> ExtractedContent:
+        # Late imports so the module doesn't hard-fail if Tesseract isn't
+        # installed in environments that always use Document Intelligence.
+        try:
+            import pytesseract
+            from pdf2image import convert_from_bytes
+        except ImportError as e:
+            raise RuntimeError(
+                "Tesseract fallback requires 'pytesseract' and 'pdf2image'. "
+                f"Install them or ensure Document Intelligence is reachable. ({e})"
+            ) from e
+
+        images = convert_from_bytes(pdf_bytes, dpi=300)
+        text_parts: list[str] = []
+
+        for img in images:
+            page_text = pytesseract.image_to_string(img, lang="eng")
+            text_parts.append(page_text)
+
+        full_text = "\n".join(text_parts)
+
+        # Heuristic heading detection: ALL-CAPS lines or lines ending with ":"
+        headings = [
+            line.strip()
+            for line in full_text.splitlines()
+            if line.strip() and (
+                line.strip().isupper() or re.match(r"^[A-Z][^.?!]{5,80}:$", line.strip())
+            )
+        ]
+
+        return ExtractedContent(
+            raw_text=full_text,
+            tables=[],           # Tesseract doesn't extract structured tables
+            section_headings=headings,
+            page_count=len(images),
+            extraction_method="tesseract",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Dead Letter Queue (Azure Service Bus)
+# ---------------------------------------------------------------------------
+
+
+class DeadLetterQueue:
+    """
+    Publishes failed-document payloads to an Azure Service Bus queue for
+    manual review or retry by downstream consumers.
+    """
+
+    def __init__(self) -> None:
+        conn_str = _env("AZURE_SERVICEBUS_CONN_STR")
+        self._queue_name = _env("AZURE_SERVICEBUS_DLQ_QUEUE", "rbi-ingestion-dlq")
+        self._client = ServiceBusClient.from_connection_string(conn_str)
+
+    def send(self, document_id: str, source_url: str, error: str) -> None:
+        payload = {
+            "document_id": document_id,
+            "regulator": REGULATOR,
+            "source_url": source_url,
+            "error": error,
+            "failed_at": _utcnow_iso(),
+            "region": AZURE_REGION,
+        }
+        message_body = json.dumps(payload)
+
+        with self._client:
+            sender = self._client.get_queue_sender(queue_name=self._queue_name)
+            with sender:
+                msg = ServiceBusMessage(
+                    body=message_body,
+                    subject="rbi-ingestion-failure",
+                    application_properties={
+                        "document_id": document_id,
+                        "regulator": REGULATOR,
+                    },
+                )
+                sender.send_messages(msg)
+                logger.warning(
+                    "Sent document '%s' to DLQ. Reason: %s", document_id, error
+                )
+
+
+# ---------------------------------------------------------------------------
+# Feed Fetcher
+# ---------------------------------------------------------------------------
+
+
+class FeedFetcher:
+    """Fetches and parses the RBI RSS/Atom notifications feed."""
+
+    def __init__(self, feed_url: str) -> None:
+        self._feed_url = feed_url
+
+    def fetch_entries(self) -> list[RawFeedEntry]:
+        logger.info("Fetching RBI feed: %s", self._feed_url)
+        resp = requests.get(self._feed_url, timeout=FEED_TIMEOUT)
+        resp.raise_for_status()
+
+        feed = feedparser.parse(resp.content)
+        entries: list[RawFeedEntry] = []
+
+        for item in feed.entries:
+            link = getattr(item, "link", "") or ""
+            title = getattr(item, "title", "Untitled") or "Untitled"
+            entry_id = getattr(item, "id", link) or link
+            summary = getattr(item, "summary", "") or ""
+
+            # Parse published date; fall back to now
+            pub_parsed = getattr(item, "published_parsed", None)
+            if pub_parsed:
+                published = datetime(*pub_parsed[:6], tzinfo=timezone.utc)
+            else:
+                published = datetime.now(timezone.utc)
+
+            if not link:
+                logger.debug("Skipping entry without link: %s", title)
+                continue
+
+            entries.append(
+                RawFeedEntry(
+                    entry_id=entry_id,
+                    title=title,
+                    link=link,
+                    published=published,
+                    summary=summary,
+                )
+            )
+
+        logger.info("Parsed %d entries from feed.", len(entries))
+        return entries
+
+    @staticmethod
+    def download_pdf(url: str) -> bytes:
+        """Download a PDF from a URL, following redirects."""
+        logger.debug("Downloading PDF: %s", url)
+        with requests.get(url, timeout=PDF_DOWNLOAD_TIMEOUT, stream=True) as resp:
+            resp.raise_for_status()
+            buf = io.BytesIO()
+            for chunk in resp.iter_content(chunk_size=PDF_CHUNK_SIZE):
+                buf.write(chunk)
+        return buf.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Schema Normalizer
+# ---------------------------------------------------------------------------
+
+
+def normalize(
+    entry: RawFeedEntry,
+    blob_path: str,
+    content: ExtractedContent,
+) -> NormalizedDocument:
+    """
+    Produces the canonical JSON-serializable document schema.
+
+    Schema
+    ------
+    {
+        "document_id"       : str,          # UUID v4
+        "regulator"         : "rbi",
+        "source_url"        : str,
+        "blob_path"         : str,          # Azure Blob path
+        "published_date"    : str,          # ISO-8601
+        "title"             : str,
+        "sha256"            : str,          # SHA-256 of (link|title)
+        "extracted_content" : {
+            "raw_text"          : str,
+            "tables"            : [...],
+            "section_headings"  : [...],
+            "page_count"        : int,
+            "extraction_method" : str
+        },
+        "ingested_at"       : str           # ISO-8601
+    }
+    """
+    return NormalizedDocument(
+        document_id=str(uuid.uuid4()),
+        regulator=REGULATOR,
+        source_url=entry.link,
+        blob_path=blob_path,
+        published_date=entry.published.isoformat(),
+        title=entry.title,
+        sha256=entry.sha256,
+        extracted_content={
+            "raw_text": content.raw_text,
+            "tables": content.tables,
+            "section_headings": content.section_headings,
+            "page_count": content.page_count,
+            "extraction_method": content.extraction_method,
+        },
+        ingested_at=_utcnow_iso(),
     )
 
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "doc_id":         self.doc_id,
-            "source":         self.source.value,
-            "source_url":     self.source_url,
-            "status":         self.status.value,
-            "content_hash":   self.content_hash,
-            "confidence":     round(self.confidence, 4),
-            "ocr_used":       self.ocr_used,
-            "blob_path":      self.blob_path,
-            "metadata":       self.metadata,
-            "errors":         self.errors,
-            "timestamp":      self.timestamp,
-        }
+
+def document_to_dict(doc: NormalizedDocument) -> dict[str, Any]:
+    return {
+        "document_id": doc.document_id,
+        "regulator": doc.regulator,
+        "source_url": doc.source_url,
+        "blob_path": doc.blob_path,
+        "published_date": doc.published_date,
+        "title": doc.title,
+        "sha256": doc.sha256,
+        "extracted_content": doc.extracted_content,
+        "ingested_at": doc.ingested_at,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Ingestion Engine
+# ---------------------------------------------------------------------------
+
+
+class RBIIngestionEngine:
+    """
+    Orchestrates the full RBI notification ingestion pipeline.
+
+    Usage
+    -----
+    engine = RBIIngestionEngine()
+    results = engine.run()
+    """
+
+    def __init__(self, feed_url: str | None = None) -> None:
+        self._feed_url = feed_url or _env("RBI_FEED_URL", DEFAULT_RBI_FEED_URL)
+        self._fetcher = FeedFetcher(self._feed_url)
+        self._registry = HashRegistry()
+        self._blob_store = BlobStore()
+        self._parser = DocumentParser()
+        self._dlq = DeadLetterQueue()
+
+    # ------------------------------------------------------------------
+    # Main entry point
+    # ------------------------------------------------------------------
+
+    def run(self) -> list[dict[str, Any]]:
+        """
+        Execute one full ingestion cycle.
+
+        Returns a list of normalized document dicts for all successfully
+        ingested documents in this run.
+        """
+        logger.info("=== RBI Ingestion Engine starting (region: %s) ===", AZURE_REGION)
+        entries = self._fetcher.fetch_entries()
+
+        ingested: list[dict[str, Any]] = []
+        skipped = 0
+        failed = 0
+
+        for entry in entries:
+            if self._registry.exists(entry.sha256):
+                logger.debug("Skipping duplicate: %s (sha256=%s)", entry.title, entry.sha256[:12])
+                skipped += 1
+                continue
+
+            result = self._process_entry(entry)
+            if result is not None:
+                ingested.append(result)
+            else:
+                failed += 1
+
+        logger.info(
+            "=== Ingestion cycle complete — ingested=%d | skipped=%d | failed=%d ===",
+            len(ingested),
+            skipped,
+            failed,
+        )
+        return ingested
+
+
+# ---------------------------------------------------------------------------
+# Compatibility shims for the orchestrator (main.py)
+# ---------------------------------------------------------------------------
+
+
+class RegulatorySource(Enum):
+    RBI = "RBI"
 
 
 @dataclass
 class FetchConfig:
-    """Configuration for the ingestion engine."""
-    # ADLS Gen2
-    adls_connection_string: str = ""
-    adls_account_name:      str = ""
-    adls_container_name:    str = "compliance-docs"
-
-    # Cosmos DB (deduplication registry)
-    cosmos_connection_string: str = ""
-    cosmos_database:          str = "compliancedb"
-    cosmos_container:         str = "document_registry"
-
-    # Azure Document Intelligence
-    form_recognizer_endpoint: str = ""
-    form_recognizer_key:      str = ""
-
-    # Azure region enforcement
-    azure_region: str = "centralindia"
-
-    # HTTP client settings
-    http_timeout: int = 30
-    max_retries:  int = 3
-
-    # Source URLs for regulatory bodies
-    source_urls: dict[str, str] = field(default_factory=lambda: {
-        "RBI":     "https://www.rbi.org.in",
-        "SEBI":    "https://www.sebi.gov.in",
-        "CERT_IN": "https://www.cert-in.org.in",
-        "DPDP":    "https://www.meity.gov.in",
-    })
+    adls_connection_string: str | None = None
+    adls_account_name: str | None = None
+    adls_container_name: str = BLOB_CONTAINER
+    cosmos_connection_string: str | None = None
+    form_recognizer_endpoint: str | None = None
+    form_recognizer_key: str | None = None
+    azure_region: str = AZURE_REGION
+    source_urls: dict[str, str] = field(default_factory=lambda: {"RBI": DEFAULT_RBI_FEED_URL})
 
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Deduplication Engine
-# ──────────────────────────────────────────────────────────────────────────────
+@dataclass
+class IngestionResult:
+    doc_id: str
+    source: RegulatorySource
+    blob_path: str
+    metadata: dict
+    extracted_text: str
+    content_hash: str
+    ocr_used: bool
+    confidence: float
 
-class DeduplicationEngine:
-    """
-    SHA-256 hash-based deduplication backed by Cosmos DB.
 
-    Before processing a document, we compute its SHA-256 hash and check
-    whether the same hash already exists in the registry.
+class IngestionEngine:
+    """Lightweight compatibility wrapper around RBIIngestionEngine.
+
+    Provides the minimal interface expected by `main.py`:
+        engine = IngestionEngine(fetch_cfg)
+        engine.ingest(url, RegulatorySource.RBI)
     """
 
-    def __init__(self, connection_string: Optional[str] = None,
-                 database: str = "compliancedb",
-                 container: str = "document_registry"):
-        self._container = None
-        self._in_memory: dict[str, dict[str, Any]] = {}
+    def __init__(self, fetch_cfg: FetchConfig | None = None) -> None:
+        self._cfg = fetch_cfg or FetchConfig()
 
-        if connection_string:
-            try:
-                from azure.cosmos import CosmosClient, PartitionKey
-                client = CosmosClient.from_connection_string(connection_string)
-                db = client.create_database_if_not_exists(database)
-                self._container = db.create_container_if_not_exists(
-                    id=container,
-                    partition_key=PartitionKey(path="/content_hash"),
-                )
-                logger.info("Dedup engine connected to Cosmos DB")
-            except Exception as exc:
-                logger.warning("Dedup Cosmos connection failed: %s. "
-                               "Using in-memory store.", exc)
-
-    def compute_hash(self, content: bytes) -> str:
-        """Compute SHA-256 hash of document content."""
-        return hashlib.sha256(content).hexdigest()
-
-    def is_duplicate(self, content_hash: str) -> bool:
-        """Check if a document with this hash has already been ingested."""
-        if self._container:
-            try:
-                query = ("SELECT c.id FROM c WHERE c.content_hash = @hash")
-                items = list(self._container.query_items(
-                    query=query,
-                    parameters=[{"name": "@hash", "value": content_hash}],
-                    enable_cross_partition_query=True,
-                    max_item_count=1,
-                ))
-                return len(items) > 0
-            except Exception as exc:
-                logger.error("Dedup check failed: %s", exc)
-
-        return content_hash in self._in_memory
-
-    def register(self, content_hash: str, doc_id: str,
-                 metadata: dict[str, Any]) -> None:
-        """Register a newly ingested document hash."""
-        record = {
-            "id": doc_id,
-            "content_hash": content_hash,
-            "registered_at": datetime.now(tz=timezone.utc).isoformat(),
-            **metadata,
-        }
-
-        if self._container:
-            try:
-                self._container.create_item(body=record)
-            except Exception as exc:
-                logger.error("Dedup register failed: %s", exc)
-                self._in_memory[content_hash] = record
-        else:
-            self._in_memory[content_hash] = record
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Document Parser (Azure Document Intelligence)
-# ──────────────────────────────────────────────────────────────────────────────
-
-class DocumentParser:
-    """
-    Extracts text and structure from documents using Azure Document Intelligence
-    (Form Recognizer). Falls back to OCR if text extraction confidence is low.
-    """
-
-    def __init__(self, endpoint: str = "", api_key: str = ""):
-        self._endpoint = endpoint
-        self._api_key = api_key
-        self._client = None
-
-        if endpoint and api_key:
-            try:
-                from azure.ai.formrecognizer import DocumentAnalysisClient
-                from azure.core.credentials import AzureKeyCredential
-                self._client = DocumentAnalysisClient(
-                    endpoint=endpoint,
-                    credential=AzureKeyCredential(api_key),
-                )
-                logger.info("Document Intelligence client initialised")
-            except Exception as exc:
-                logger.warning("Document Intelligence setup failed: %s", exc)
-
-    def parse(self, content: bytes, mime_type: str = "application/pdf"
-              ) -> tuple[str, float, dict[str, Any]]:
-        """
-        Parse a document and return (extracted_text, confidence, metadata).
-
-        If the primary extraction confidence is below OCR_CONFIDENCE_THRESHOLD,
-        the OCR fallback is automatically triggered.
-        """
-        if self._client:
-            return self._parse_with_azure(content)
-        else:
-            return self._parse_fallback(content, mime_type)
-
-    def _parse_with_azure(self, content: bytes
-                          ) -> tuple[str, float, dict[str, Any]]:
-        """Use Azure Document Intelligence for text extraction."""
-        try:
-            poller = self._client.begin_analyze_document(
-                "prebuilt-read", content
+    def ingest(self, url: str, source: RegulatorySource) -> IngestionResult:
+        # Use RBIIngestionEngine to perform a single ingestion run for the
+        # provided feed URL and return the first ingested document as a
+        # compatibility IngestionResult.
+        engine = RBIIngestionEngine(feed_url=url)
+        results = engine.run()
+        if not results:
+            # No documents found — return an empty placeholder
+            return IngestionResult(
+                doc_id="", source=source, blob_path=url, metadata={},
+                extracted_text="", content_hash="", ocr_used=False, confidence=0.0
             )
-            result = poller.result()
 
-            text_parts = []
-            total_confidence = 0.0
-            page_count = 0
+        doc = results[0]
+        extracted = doc.get("extracted_content", {})
+        method = extracted.get("extraction_method", "document_intelligence")
+        return IngestionResult(
+            doc_id=doc.get("document_id", ""),
+            source=source,
+            blob_path=doc.get("blob_path", url),
+            metadata={
+                "mime_type": "application/pdf",
+            },
+            extracted_text=extracted.get("raw_text", ""),
+            content_hash=doc.get("sha256", ""),
+            ocr_used=(method == "tesseract"),
+            confidence=0.95 if extracted.get("raw_text") else 0.0,
+        )
 
-            for page in result.pages:
-                page_count += 1
-                for line in page.lines:
-                    text_parts.append(line.content)
-                    # Average word confidences for the line
-                    if hasattr(line, 'spans') and line.spans:
-                        total_confidence += sum(
-                            w.confidence for w in page.words
-                            if any(s.offset <= w.span.offset < s.offset + s.length
-                                   for s in line.spans)
-                        ) / max(len(page.words), 1)
+    # ------------------------------------------------------------------
+    # Per-entry processing
+    # ------------------------------------------------------------------
 
-            avg_confidence = total_confidence / max(page_count, 1)
-            extracted_text = "\n".join(text_parts)
+    def _process_entry(self, entry: RawFeedEntry) -> dict[str, Any] | None:
+        document_id = str(uuid.uuid4())
+        logger.info("Processing [%s] %s", document_id[:8], entry.title)
 
-            metadata = {
-                "page_count": page_count,
-                "word_count": len(extracted_text.split()),
-                "engine":     "azure_document_intelligence",
-            }
-
-            # OCR fallback if confidence is too low
-            if avg_confidence < OCR_CONFIDENCE_THRESHOLD:
-                logger.warning(
-                    "Low confidence (%.2f). Triggering OCR fallback.",
-                    avg_confidence
-                )
-                return self._ocr_fallback(content, metadata)
-
-            return extracted_text, avg_confidence, metadata
-
-        except Exception as exc:
-            logger.error("Azure Document Intelligence failed: %s", exc)
-            return self._parse_fallback(content, "application/pdf")
-
-    def _ocr_fallback(self, content: bytes, base_metadata: dict[str, Any]
-                      ) -> tuple[str, float, dict[str, Any]]:
-        """OCR fallback using Azure Document Intelligence OCR model."""
-        if not self._client:
-            return "", 0.0, {"engine": "ocr_fallback_unavailable"}
-
+        # Step 1 — Download PDF
         try:
-            poller = self._client.begin_analyze_document(
-                "prebuilt-read", content,
-                features=["OCR_HIGH_RESOLUTION"],
-            )
-            result = poller.result()
-
-            text_parts = []
-            total_confidence = 0.0
-            word_count = 0
-
-            for page in result.pages:
-                for word in page.words:
-                    text_parts.append(word.content)
-                    total_confidence += word.confidence
-                    word_count += 1
-
-            avg_conf = total_confidence / max(word_count, 1)
-            metadata = {
-                **base_metadata,
-                "engine": "azure_ocr_high_resolution",
-                "ocr_word_count": word_count,
-            }
-            return " ".join(text_parts), avg_conf, metadata
-
+            pdf_bytes = self._fetcher.download_pdf(entry.link)
         except Exception as exc:
-            logger.error("OCR fallback failed: %s", exc)
-            return "", 0.0, {"engine": "ocr_fallback_failed", "error": str(exc)}
+            error_msg = f"PDF download failed: {exc}"
+            logger.error(error_msg)
+            self._dlq.send(document_id, entry.link, error_msg)
+            return None
 
-    def _parse_fallback(self, content: bytes, mime_type: str
-                        ) -> tuple[str, float, dict[str, Any]]:
-        """Basic text extraction fallback when Azure is not available."""
+        # Step 2 — Upload raw PDF to Blob Storage
         try:
-            if mime_type == "text/plain":
-                text = content.decode("utf-8", errors="replace")
-                return text, 0.90, {"engine": "plaintext_decode"}
+            blob_path = self._blob_store.upload_pdf(pdf_bytes, document_id, entry.published)
+        except AzureError as exc:
+            error_msg = f"Blob upload failed: {exc}"
+            logger.error(error_msg)
+            self._dlq.send(document_id, entry.link, error_msg)
+            return None
 
-            if mime_type == "text/html":
-                text = content.decode("utf-8", errors="replace")
-                # Strip HTML tags (basic)
-                import re
-                text = re.sub(r'<[^>]+>', ' ', text)
-                text = re.sub(r'\s+', ' ', text).strip()
-                return text, 0.80, {"engine": "html_strip"}
-
-            if mime_type == "application/pdf":
-                try:
-                    import PyPDF2
-                    import io
-                    reader = PyPDF2.PdfReader(io.BytesIO(content))
-                    text_parts = []
-                    for page in reader.pages:
-                        text_parts.append(page.extract_text() or "")
-                    text = "\n".join(text_parts)
-                    confidence = 0.75 if text.strip() else 0.10
-                    return text, confidence, {
-                        "engine": "pypdf2_fallback",
-                        "page_count": len(reader.pages),
-                    }
-                except ImportError:
-                    logger.warning("PyPDF2 not available for PDF fallback")
-                    return "", 0.0, {"engine": "no_pdf_parser_available"}
-
-            return "", 0.0, {"engine": "unsupported_mime_type",
-                             "mime_type": mime_type}
-
+        # Step 3 — Parse PDF
+        try:
+            content = self._parser.parse(pdf_bytes)
         except Exception as exc:
-            logger.error("Fallback parsing failed: %s", exc)
-            return "", 0.0, {"engine": "fallback_failed", "error": str(exc)}
+            error_msg = f"PDF parsing failed: {exc}"
+            logger.error(error_msg)
+            self._dlq.send(document_id, entry.link, error_msg)
+            return None
 
+        # Step 4 — Normalize
+        doc = normalize(entry, blob_path, content)
 
-# ──────────────────────────────────────────────────────────────────────────────
-# Blob Storage Manager
-# ──────────────────────────────────────────────────────────────────────────────
-
-class BlobStorageManager:
-    """Manages document storage in ADLS Gen2 / Azure Blob Storage."""
-
-    def __init__(self, connection_string: str = "",
-                 account_name: str = "",
-                 container_name: str = "compliance-docs"):
-        self._container_client = None
-        self._container_name = container_name
-
-        if connection_string:
-            try:
-                from azure.storage.blob import BlobServiceClient
-                svc = BlobServiceClient.from_connection_string(connection_string)
-                self._container_client = svc.get_container_client(container_name)
-                # Create container if it doesn't exist
-                try:
-                    self._container_client.get_container_properties()
-                except Exception:
-                    self._container_client.create_container()
-                logger.info("Blob storage connected: %s", container_name)
-            except Exception as exc:
-                logger.warning("Blob storage setup failed: %s", exc)
-
-    def upload(self, doc_id: str, content: bytes,
-               metadata: dict[str, str]) -> str:
-        """Upload document content and return the blob path."""
-        blob_name = f"documents/{doc_id}/{doc_id}.bin"
-
-        if self._container_client:
-            try:
-                blob_client = self._container_client.get_blob_client(blob_name)
-                blob_client.upload_blob(
-                    content,
-                    overwrite=True,
-                    metadata=metadata,
-                )
-                logger.info("Document uploaded to blob: %s", blob_name)
-                return blob_name
-            except Exception as exc:
-                logger.error("Blob upload failed: %s", exc)
-
-        # Fallback: return a reference path
-        logger.warning("Blob storage unavailable. Document not persisted.")
-        return f"local://{blob_name}"
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Regulatory Document Fetcher
-# ──────────────────────────────────────────────────────────────────────────────
-
-class RegulatoryFetcher:
-    """
-    Fetches regulatory documents from official sources via HTTP.
-
-    Enforces data residency by only connecting from the India Central region
-    (the AKS cluster runs exclusively in centralindia).
-    """
-
-    def __init__(self, config: FetchConfig):
-        self._config = config
-        self._http = httpx.Client(
-            timeout=config.http_timeout,
-            follow_redirects=True,
-            headers={
-                "User-Agent": "ComplianceBot/1.0 (Azure India Central)",
-                "Accept": "application/pdf, text/html, text/plain",
+        # Step 5 — Register hash (only on full success)
+        self._registry.register(
+            entry.sha256,
+            {
+                "document_id": doc.document_id,
+                "title": entry.title[:200],
+                "source_url": entry.link[:500],
             },
         )
 
-    def fetch(self, url: str, source: RegulatorySource) -> tuple[bytes, str]:
-        """
-        Fetch a document from a regulatory source URL.
-
-        Returns (content_bytes, mime_type).
-
-        Raises
-        ------
-        httpx.HTTPStatusError  On non-2xx responses.
-        httpx.TimeoutException On timeout.
-        """
-        logger.info("Fetching document: source=%s url=%s", source.value, url)
-
-        response = self._http.get(url)
-        response.raise_for_status()
-
-        content_type = response.headers.get("content-type", "application/pdf")
-        mime_type = content_type.split(";")[0].strip()
-
-        logger.info("Fetched %d bytes (mime=%s)", len(response.content), mime_type)
-        return response.content, mime_type
-
-    def close(self) -> None:
-        self._http.close()
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# Ingestion Engine — Main Orchestrator
-# ──────────────────────────────────────────────────────────────────────────────
-
-class IngestionEngine:
-    """
-    End-to-end ingestion pipeline:
-      Fetch → Deduplicate → Parse → OCR Fallback → Store
-
-    Usage::
-
-        config = FetchConfig(
-            adls_connection_string="...",
-            cosmos_connection_string="...",
-            form_recognizer_endpoint="...",
-            form_recognizer_key="...",
+        logger.info(
+            "Successfully ingested document_id=%s method=%s pages=%d",
+            doc.document_id,
+            content.extraction_method,
+            content.page_count,
         )
-        engine = IngestionEngine(config)
-        result = engine.ingest(url="https://rbi.org.in/...", source=RegulatorySource.RBI)
-    """
+        return document_to_dict(doc)
 
-    def __init__(self, config: FetchConfig):
-        self._config = config
-        self._fetcher = RegulatoryFetcher(config)
-        self._dedup = DeduplicationEngine(
-            connection_string=config.cosmos_connection_string,
-            database=config.cosmos_database,
-            container=config.cosmos_container,
-        )
-        self._parser = DocumentParser(
-            endpoint=config.form_recognizer_endpoint,
-            api_key=config.form_recognizer_key,
-        )
-        self._storage = BlobStorageManager(
-            connection_string=config.adls_connection_string,
-            account_name=config.adls_account_name,
-            container_name=config.adls_container_name,
-        )
 
-    def ingest(self, url: str, source: RegulatorySource,
-               content: Optional[bytes] = None,
-               mime_type: str = "application/pdf") -> IngestionResult:
-        """
-        Run the full ingestion pipeline for a single document.
+# ---------------------------------------------------------------------------
+# CLI entrypoint (for local testing / Azure Container Jobs)
+# ---------------------------------------------------------------------------
 
-        If `content` is provided, the fetch step is skipped (useful for
-        documents already downloaded or received via Service Bus).
-        """
-        doc_id = f"doc-{uuid.uuid4().hex[:12]}"
-        result = IngestionResult(
-            doc_id=doc_id,
-            source=source,
-            source_url=url,
-            status=IngestionStatus.PENDING,
-        )
+if __name__ == "__main__":
+    import sys
 
-        try:
-            # Step 1: Fetch (if content not provided)
-            if content is None:
-                content, mime_type = self._fetcher.fetch(url, source)
-            result.status = IngestionStatus.FETCHED
+    feed_url = sys.argv[1] if len(sys.argv) > 1 else None
+    engine = RBIIngestionEngine(feed_url=feed_url)
+    results = engine.run()
 
-            # Validate mime type
-            if mime_type not in SUPPORTED_MIME_TYPES:
-                logger.warning("Unsupported mime type: %s", mime_type)
+    output_path = os.path.join(tempfile.gettempdir(), "rbi_ingestion_results.json")
+    with open(output_path, "w", encoding="utf-8") as fh:
+        json.dump(results, fh, indent=2, ensure_ascii=False)
 
-            # Validate size
-            size_mb = len(content) / (1024 * 1024)
-            if size_mb > MAX_DOCUMENT_SIZE_MB:
-                raise ValueError(
-                    f"Document exceeds max size: {size_mb:.1f}MB > "
-                    f"{MAX_DOCUMENT_SIZE_MB}MB"
-                )
-
-            # Step 2: Deduplication
-            content_hash = self._dedup.compute_hash(content)
-            result.content_hash = content_hash
-
-            if self._dedup.is_duplicate(content_hash):
-                result.status = IngestionStatus.DUPLICATE
-                logger.info("Duplicate document detected: hash=%s", content_hash[:16])
-                return result
-
-            # Step 3: Parse (with automatic OCR fallback)
-            extracted_text, confidence, parse_meta = self._parser.parse(
-                content, mime_type
-            )
-            result.extracted_text = extracted_text
-            result.confidence = confidence
-            result.ocr_used = "ocr" in parse_meta.get("engine", "").lower()
-            result.metadata.update(parse_meta)
-
-            if confidence < OCR_CONFIDENCE_THRESHOLD and not result.ocr_used:
-                result.status = IngestionStatus.OCR_NEEDED
-                logger.warning("Low parse confidence (%.2f). OCR may be needed.",
-                               confidence)
-
-            result.status = IngestionStatus.PARSED
-
-            # Step 4: Store in blob storage
-            blob_path = self._storage.upload(
-                doc_id=doc_id,
-                content=content,
-                metadata={
-                    "source": source.value,
-                    "content_hash": content_hash,
-                    "mime_type": mime_type,
-                    "region": self._config.azure_region,
-                },
-            )
-            result.blob_path = blob_path
-
-            # Step 5: Register in dedup registry
-            self._dedup.register(content_hash, doc_id, {
-                "source": source.value,
-                "source_url": url,
-                "blob_path": blob_path,
-                "mime_type": mime_type,
-            })
-
-            result.status = IngestionStatus.COMPLETED
-            logger.info(
-                "Ingestion complete: doc=%s hash=%s confidence=%.2f",
-                doc_id, content_hash[:16], confidence
-            )
-
-        except Exception as exc:
-            result.status = IngestionStatus.FAILED
-            result.errors.append(f"{type(exc).__name__}: {exc}")
-            logger.error("Ingestion failed for %s: %s", url, exc)
-
-        return result
-
-    def ingest_batch(self, documents: list[dict[str, Any]]
-                     ) -> list[IngestionResult]:
-        """
-        Ingest multiple documents.
-
-        Each dict in `documents` should have keys: "url", "source".
-        Optional: "content", "mime_type".
-        """
-        results = []
-        for doc in documents:
-            source = RegulatorySource(doc["source"])
-            result = self.ingest(
-                url=doc["url"],
-                source=source,
-                content=doc.get("content"),
-                mime_type=doc.get("mime_type", "application/pdf"),
-            )
-            results.append(result)
-        return results
-
-    def close(self) -> None:
-        """Release HTTP client resources."""
-        self._fetcher.close()
+    print(f"Ingested {len(results)} documents. Output written to: {output_path}")
